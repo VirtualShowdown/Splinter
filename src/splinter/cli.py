@@ -9,17 +9,19 @@ from pathlib import Path
 
 from colorama import Fore, Style, just_fix_windows_console
 
+from .config import load_project_config
 from .exceptions import PySplitError
 from .history import record_split_history, rollback_last
 from .resolver import TargetSpec, parse_target, resolve_target
-from .splitter import SplitOptions, split_function
+from .splitter import GroupSplitResult, SplitOptions, build_function_call_groups, split_function, split_group
 from .utils import path_to_module_parts
 
 just_fix_windows_console()
 
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
+    config = config or {}
     parser = argparse.ArgumentParser(
         prog="Splinter",
         description="Split a top-level Python function into its own module and rewrite imports.",
@@ -53,6 +55,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-package",
         default="modules",
         help="Package name to create extracted modules in. Defaults to 'modules'.",
+    )
+    splitfunc.set_defaults(
+        output_package=config.get("output_package", "modules"),
+        validate=config.get("validate", False),
     )
 
     splitall = subparsers.add_parser(
@@ -102,6 +108,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Only split public top-level functions whose names do not start with an underscore.",
     )
+    splitall.add_argument(
+        "--related",
+        action="store_true",
+        help=(
+            "Group functions that reference each other into a single shared module file "
+            "instead of splitting each function into its own file."
+        ),
+    )
+    splitall.set_defaults(
+        output_package=config.get("output_package", "modules"),
+        validate=config.get("validate", False),
+        public_only=config.get("public_only", False),
+        include=config.get("include"),
+        exclude=config.get("exclude"),
+        related=config.get("related", False),
+    )
 
     undo = subparsers.add_parser(
         "undo",
@@ -125,7 +147,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
+    # Quick pre-parse to locate --cwd before loading the project config.
+    _pre = argparse.ArgumentParser(add_help=False)
+    _pre.add_argument("--cwd", default=".")
+    pre_args, _ = _pre.parse_known_args(argv)
+
+    config = load_project_config(Path(pre_args.cwd))
+    parser = build_parser(config)
     args = parser.parse_args(argv)
 
     try:
@@ -154,6 +182,7 @@ def main(argv: list[str] | None = None) -> int:
                 include_patterns=_parse_patterns(args.include),
                 exclude_patterns=_parse_patterns(args.exclude),
                 public_only=args.public_only,
+                related=args.related,
             )
             if split_count == 0:
                 print("No top-level functions found.")
@@ -184,6 +213,7 @@ def _split_all(
     include_patterns: list[str],
     exclude_patterns: list[str],
     public_only: bool,
+    related: bool = False,
 ) -> int:
     target_files = _resolve_splitall_files(path_arg, directory_arg, cwd)
     split_count = 0
@@ -197,9 +227,13 @@ def _split_all(
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
             public_only=public_only,
+            related=related,
         )
         results.extend(file_results)
-        split_count += len(file_results)
+        split_count += sum(
+            len(r.function_names) if isinstance(r, GroupSplitResult) else 1
+            for r in file_results
+        )
 
     if results and not options.preview:
         descriptor = path_arg if path_arg else f"--dir {directory_arg}"
@@ -243,6 +277,7 @@ def _split_all_in_file(
     include_patterns: list[str],
     exclude_patterns: list[str],
     public_only: bool,
+    related: bool = False,
 ) -> list:
     function_names = _list_top_level_function_names(
         file_path,
@@ -253,15 +288,40 @@ def _split_all_in_file(
     module_path = _module_path_from_file(file_path, cwd)
     results = []
 
-    for function_name in function_names:
-        spec = TargetSpec(module_path=module_path, function_name=function_name)
-        resolved = resolve_target(spec, cwd=cwd)
-        result = split_function(resolved, options=options)
-        results.append(result)
-        _print_split_result(result)
-        print(f"Updated: {result.module_file}")
-        print(f"Created: {result.new_module_file}")
-        print(f"Inserted import: {result.import_statement}")
+    if not related:
+        for function_name in function_names:
+            spec = TargetSpec(module_path=module_path, function_name=function_name)
+            resolved = resolve_target(spec, cwd=cwd)
+            result = split_function(resolved, options=options)
+            results.append(result)
+            _print_split_result(result)
+            print(f"Updated: {result.module_file}")
+            print(f"Created: {result.new_module_file}")
+            print(f"Inserted import: {result.import_statement}")
+        return results
+
+    # --related: group functions by mutual references before splitting.
+    source_text = file_path.read_text(encoding="utf-8")
+    groups = build_function_call_groups(source_text, function_names, file_path)
+
+    for group in groups:
+        if len(group) == 1:
+            function_name = group[0]
+            spec = TargetSpec(module_path=module_path, function_name=function_name)
+            resolved = resolve_target(spec, cwd=cwd)
+            result = split_function(resolved, options=options)
+            results.append(result)
+            _print_split_result(result)
+            print(f"Updated: {result.module_file}")
+            print(f"Created: {result.new_module_file}")
+            print(f"Inserted import: {result.import_statement}")
+        else:
+            primary = group[0]
+            spec = TargetSpec(module_path=module_path, function_name=primary)
+            resolved = resolve_target(spec, cwd=cwd)
+            result = split_group(resolved, group, options=options)
+            results.append(result)
+            _print_group_result(result)
 
     return results
 
@@ -319,9 +379,24 @@ def _print_split_result(result) -> None:
             _print_preview_diff(diff)
 
 
-def _parse_patterns(raw_patterns: str | None) -> list[str]:
+def _print_group_result(result: GroupSplitResult) -> None:
+    action = "Would split" if result.preview else "Split"
+    verb = _color_text(action, Fore.CYAN if result.preview else Fore.GREEN)
+    names_str = _color_text(", ".join(f"'{n}'" for n in result.function_names), Fore.MAGENTA)
+    print(f"{verb} related group [{names_str}] → {result.new_module_file.name}")
+    if result.preview:
+        for diff in result.preview_diffs:
+            _print_preview_diff(diff)
+    print(f"Updated: {result.module_file}")
+    print(f"Created: {result.new_module_file}")
+    print(f"Inserted import: {result.import_statement}")
+
+
+def _parse_patterns(raw_patterns: str | list | None) -> list[str]:
     if raw_patterns is None:
         return []
+    if isinstance(raw_patterns, list):
+        return [str(p).strip() for p in raw_patterns if str(p).strip()]
     return [pattern.strip() for pattern in raw_patterns.split(",") if pattern.strip()]
 
 

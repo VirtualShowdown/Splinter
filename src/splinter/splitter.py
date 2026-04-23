@@ -56,6 +56,31 @@ class ModuleAnalysis:
     source_text: str
 
 
+@dataclass(slots=True)
+class MultiModuleAnalysis:
+    tree: ast.Module
+    imports: list[ast.stmt]
+    definitions: dict[str, ast.stmt]
+    targets: list[FunctionNodeInfo]
+    source_text: str
+
+
+@dataclass(slots=True)
+class GroupSplitResult:
+    module_file: Path
+    new_module_file: Path
+    function_names: list[str]
+    import_statement: str
+    module_text: str
+    new_module_text: str
+    init_file: Path
+    init_text: str
+    preview: bool
+    file_changes: list[FileChange]
+    output_package: str
+    preview_diffs: list[str]
+
+
 
 def split_function(resolved: ResolvedTarget, *, options: SplitOptions | None = None, preview: bool | None = None) -> SplitResult:
     if options is None:
@@ -163,6 +188,252 @@ def split_function(resolved: ResolvedTarget, *, options: SplitOptions | None = N
         preview_diffs=_build_preview_diffs(file_changes),
     )
 
+
+
+def split_group(
+    resolved: ResolvedTarget,
+    function_names: list[str],
+    *,
+    options: SplitOptions | None = None,
+) -> GroupSplitResult:
+    """Extract a group of related functions into a single shared module file."""
+    if options is None:
+        options = SplitOptions()
+    _validate_output_package(options.output_package)
+
+    source_text = resolved.module_file.read_text(encoding="utf-8")
+    analysis = _analyze_module_for_group(source_text, function_names, resolved.module_file)
+
+    # Collect all module-level dependencies across every function in the group,
+    # but exclude the group functions themselves (they'll all be in the same file).
+    func_set = set(function_names)
+    all_dep_names: set[str] = set()
+    for target_info in analysis.targets:
+        deps = _collect_dependency_names(target_info.node, analysis.definitions)
+        all_dep_names.update(deps)
+    all_dep_names -= func_set
+
+    # The group output file is named after the first function in source order.
+    group_module_name = resolved.spec.function_name
+    package_parts = options.output_package.split(".")
+    new_module_file = resolved.module_file.parent.joinpath(*package_parts) / f"{group_module_name}.py"
+    init_file = new_module_file.parent / "__init__.py"
+    new_module_existed_before = new_module_file.exists()
+    init_file_existed_before = init_file.exists()
+    existing_new_module_text = new_module_file.read_text(encoding="utf-8") if new_module_existed_before else ""
+    existing_init_text = init_file.read_text(encoding="utf-8") if init_file_existed_before else ""
+    init_text = _updated_package_exports_for_group(existing_init_text, group_module_name, function_names)
+
+    import_block = _build_import_block(
+        analysis.imports,
+        source_text,
+        resolved.package_mode,
+        options.output_package,
+    )
+    dependency_block = _render_dependency_blocks(analysis.definitions, source_text, all_dep_names)
+
+    # Concatenate all function blocks in source order.
+    function_blocks = [
+        _extract_lines(source_text, t.start_lineno, t.end_lineno).strip()
+        for t in analysis.targets
+    ]
+    function_block = "\n\n".join(function_blocks) + "\n"
+
+    new_module_text = _compose_new_module_text(
+        source_path=resolved.module_file,
+        import_block=import_block,
+        dependency_block=dependency_block,
+        function_block=function_block,
+    )
+
+    # Remove all group functions from source in a single pass (bottom-to-top to
+    # preserve line numbers), then do cleanup once.
+    ranges = [(t.start_lineno, t.end_lineno) for t in analysis.targets]
+    updated_source = _remove_function_blocks(source_text, ranges)
+
+    # Insert one import name at a time; _insert_import merges them into a single line.
+    import_statement = _compute_group_import_statement(resolved, sorted(function_names), options.output_package)
+    for func_name in sorted(function_names):
+        single = (
+            f"from .{options.output_package} import {func_name}"
+            if resolved.package_mode
+            else f"from {options.output_package} import {func_name}"
+        )
+        updated_source = _insert_import(updated_source, single)
+
+    file_changes = [
+        FileChange(
+            path=resolved.module_file,
+            existed_before=True,
+            before_text=source_text,
+            after_text=updated_source,
+        ),
+        FileChange(
+            path=new_module_file,
+            existed_before=new_module_existed_before,
+            before_text=existing_new_module_text,
+            after_text=new_module_text,
+        ),
+        FileChange(
+            path=init_file,
+            existed_before=init_file_existed_before,
+            before_text=existing_init_text,
+            after_text=init_text,
+        ),
+    ]
+
+    if options.validate:
+        _validate_split_outputs(file_changes)
+
+    if not options.preview:
+        new_module_file.parent.mkdir(parents=True, exist_ok=True)
+        if init_text:
+            init_file.write_text(init_text, encoding="utf-8")
+        elif init_file.exists():
+            init_file.write_text("", encoding="utf-8")
+        new_module_file.write_text(new_module_text, encoding="utf-8")
+        resolved.module_file.write_text(updated_source, encoding="utf-8")
+
+    return GroupSplitResult(
+        module_file=resolved.module_file,
+        new_module_file=new_module_file,
+        function_names=function_names,
+        import_statement=import_statement,
+        module_text=updated_source,
+        new_module_text=new_module_text,
+        init_file=init_file,
+        init_text=init_text,
+        preview=options.preview,
+        file_changes=file_changes,
+        output_package=options.output_package,
+        preview_diffs=_build_preview_diffs(file_changes),
+    )
+
+
+def build_function_call_groups(
+    source_text: str,
+    function_names: list[str],
+    module_file: Path,
+) -> list[list[str]]:
+    """Group top-level functions by mutual references into connected components.
+
+    Functions that (directly or transitively) reference each other end up in the
+    same group.  Returns a list of groups where each group is a list of function
+    names in their original source order.
+    """
+    if not function_names:
+        return []
+
+    try:
+        tree = ast.parse(source_text)
+    except SyntaxError as exc:
+        raise FunctionExtractionError(f"Could not parse '{module_file}': {exc}") from exc
+
+    func_set = set(function_names)
+    source_order: list[str] = []
+    nodes: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name in func_set:
+            if stmt.name not in nodes:
+                nodes[stmt.name] = stmt
+                source_order.append(stmt.name)
+
+    # Build an undirected adjacency graph of direct cross-function references.
+    adj: dict[str, set[str]] = {name: set() for name in source_order}
+    for name, node in nodes.items():
+        for ref in _find_module_level_references(node):
+            if ref in func_set and ref != name:
+                adj[name].add(ref)
+                adj[ref].add(name)
+
+    # BFS to find connected components, preserving source order.
+    visited: set[str] = set()
+    components: list[list[str]] = []
+
+    for start in source_order:
+        if start in visited:
+            continue
+        component: list[str] = []
+        queue = [start]
+        while queue:
+            current = queue.pop(0)
+            if current in visited:
+                continue
+            visited.add(current)
+            component.append(current)
+            for neighbor in adj.get(current, set()):
+                if neighbor not in visited:
+                    queue.append(neighbor)
+        component_set = set(component)
+        components.append([n for n in source_order if n in component_set])
+
+    return components
+
+
+def _analyze_module_for_group(
+    source_text: str,
+    function_names: list[str],
+    module_file: Path,
+) -> MultiModuleAnalysis:
+    try:
+        tree = ast.parse(source_text)
+    except SyntaxError as exc:
+        raise FunctionExtractionError(f"Could not parse '{module_file}': {exc}") from exc
+
+    func_set = set(function_names)
+    imports: list[ast.stmt] = []
+    definitions: dict[str, ast.stmt] = {}
+    found: dict[str, FunctionNodeInfo] = {}
+
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            imports.append(stmt)
+            continue
+
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            definitions.setdefault(stmt.name, stmt)
+        elif isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            for name in _iter_assigned_names(stmt):
+                definitions.setdefault(name, stmt)
+
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name in func_set:
+            if stmt.name in found:
+                raise FunctionExtractionError(
+                    f"Found duplicate top-level definitions for '{stmt.name}' in '{module_file}'."
+                )
+            if stmt.end_lineno is None:
+                raise FunctionExtractionError(
+                    f"Could not determine end line for '{stmt.name}'."
+                )
+            found[stmt.name] = FunctionNodeInfo(
+                node=stmt,
+                start_lineno=_statement_start_lineno(stmt),
+                end_lineno=stmt.end_lineno,
+            )
+
+    missing = func_set - set(found)
+    if missing:
+        names_str = ", ".join(sorted(missing))
+        raise FunctionExtractionError(
+            f"Function(s) {names_str!r} not found as top-level definitions in '{module_file}'."
+        )
+
+    targets = sorted(found.values(), key=lambda t: t.start_lineno)
+    return MultiModuleAnalysis(
+        tree=tree,
+        imports=imports,
+        definitions=definitions,
+        targets=targets,
+        source_text=source_text,
+    )
+
+
+def _compute_group_import_statement(resolved: ResolvedTarget, function_names: list[str], output_package: str) -> str:
+    names_str = ", ".join(sorted(function_names))
+    if resolved.package_mode:
+        return f"from .{output_package} import {names_str}"
+    return f"from {output_package} import {names_str}"
 
 
 def _analyze_module(source_text: str, function_name: str, module_file: Path) -> ModuleAnalysis:
@@ -286,33 +557,55 @@ def _updated_package_exports(existing: str, function_name: str) -> str:
     return "".join(lines)
 
 
+def _updated_package_exports_for_group(existing: str, group_module_name: str, function_names: list[str]) -> str:
+    """Update __init__.py to export all names in a group from one submodule."""
+    names_str = ", ".join(sorted(function_names))
+    export_line = f"from .{group_module_name} import {names_str}\n"
+
+    lines = existing.splitlines(keepends=True)
+    # Remove any pre-existing individual exports for these names that would conflict.
+    filtered = [
+        line for line in lines
+        if not any(line.strip() == f"from .{n} import {n}" for n in function_names)
+    ]
+    if export_line in filtered:
+        return "".join(filtered)
+
+    filtered.append(export_line)
+    filtered = sorted(set(filtered), key=str.casefold)
+    return "".join(filtered)
+
+
 
 def _build_dependency_block(
     analysis: ModuleAnalysis,
     function_name: str,
     dependency_names: set[str] | None = None,
 ) -> str:
-    lines = analysis.source_text.splitlines(keepends=True)
-    dependency_names = set(dependency_names or _collect_dependency_names(analysis.target.node, analysis.definitions))
-    dependency_names.discard(function_name)
+    dep_names = set(dependency_names or _collect_dependency_names(analysis.target.node, analysis.definitions))
+    dep_names.discard(function_name)
+    return _render_dependency_blocks(analysis.definitions, analysis.source_text, dep_names)
 
+
+def _render_dependency_blocks(
+    definitions: dict[str, ast.stmt],
+    source_text: str,
+    dependency_names: set[str],
+) -> str:
+    lines = source_text.splitlines(keepends=True)
     blocks: list[tuple[int, str]] = []
     seen_nodes: set[int] = set()
+
     for name in dependency_names:
-        stmt = analysis.definitions.get(name)
+        stmt = definitions.get(name)
         if stmt is None or stmt.end_lineno is None:
             continue
-
         stmt_id = id(stmt)
         if stmt_id in seen_nodes:
             continue
         seen_nodes.add(stmt_id)
-        blocks.append(
-            (
-                _statement_start_lineno(stmt),
-                "".join(lines[_statement_start_lineno(stmt) - 1 : stmt.end_lineno]).rstrip(),
-            )
-        )
+        start = _statement_start_lineno(stmt)
+        blocks.append((start, "".join(lines[start - 1 : stmt.end_lineno]).rstrip()))
 
     if not blocks:
         return ""
@@ -604,6 +897,18 @@ class _ModuleLevelReferenceCollector(ast.NodeVisitor):
 def _remove_function_block(source_text: str, start_lineno: int, end_lineno: int) -> str:
     lines = source_text.splitlines(keepends=True)
     del lines[start_lineno - 1 : end_lineno]
+
+    updated = "".join(lines)
+    while "\n\n\n" in updated:
+        updated = updated.replace("\n\n\n", "\n\n")
+    return updated.lstrip("\n")
+
+
+def _remove_function_blocks(source_text: str, ranges: list[tuple[int, int]]) -> str:
+    """Remove multiple line ranges (1-indexed, inclusive) in a single pass."""
+    lines = source_text.splitlines(keepends=True)
+    for start, end in sorted(ranges, key=lambda r: r[0], reverse=True):
+        del lines[start - 1 : end]
 
     updated = "".join(lines)
     while "\n\n\n" in updated:

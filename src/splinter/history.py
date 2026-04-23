@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .exceptions import PySplitError
-from .splitter import FileChange, SplitResult
+from .splitter import FileChange, GroupSplitResult, SplitResult
 
 HISTORY_FILENAME = ".splinter_history.json"
 
@@ -16,7 +16,7 @@ class HistoryEntry:
     changes: list[FileChange]
 
 
-def record_split_history(cwd: Path, command: str, results: list[SplitResult]) -> Path:
+def record_split_history(cwd: Path, command: str, results: list[SplitResult | GroupSplitResult]) -> Path:
     if not results:
         raise PySplitError("Cannot record rollback history for an empty split operation.")
 
@@ -55,7 +55,7 @@ def _history_file(cwd: Path) -> Path:
     return cwd.resolve() / HISTORY_FILENAME
 
 
-def _coalesce_changes(results: list[SplitResult]) -> list[FileChange]:
+def _coalesce_changes(results: list[SplitResult | GroupSplitResult]) -> list[FileChange]:
     coalesced: dict[Path, FileChange] = {}
     order: list[Path] = []
 
