@@ -74,6 +74,9 @@ uv run Splinter --help
 Splinter splitfunc <module>.<function>
 Splinter splitall <path/to/file.py>
 Splinter splitall --dir <directory>
+Splinter undo [count]
+Splinter splitfunc <module>.<function> --preview
+Splinter splitall <path/to/file.py> --preview
 ```
 
 Examples:
@@ -83,12 +86,16 @@ uv run Splinter splitfunc main.area
 uv run Splinter splitfunc package.utils.normalize_name
 uv run Splinter splitall main.py
 uv run Splinter splitall --dir app
+uv run Splinter splitall main.py --preview
+uv run Splinter undo
 ```
 
 ## Notes
 
 - Splinter only moves top-level functions.
 - `splitall` is literal: it will split every top-level function it finds, including helper functions and `main()` if present.
+- Use `--preview` to inspect the planned file changes before Splinter writes anything.
+- Every non-preview split records rollback history in `.splinter_history.json`, and `undo` replays the last recorded operation.
 - The generated `modules/` package is part of the rewritten code, not just scratch output.
 
 ## Development
@@ -98,3 +105,7 @@ Run tests with:
 ```bash
 uv run python -m pytest tests --basetemp .pytest_tmp
 ```
+
+## CONTRIBUTION
+
+Feel free to give feedback and/or suggest changes. This is just meant to be a helpful tool for larger projects made for fun.

@@ -129,3 +129,26 @@ def test_split_function_merges_package_imports_and_updates_init(tmp_path: Path) 
 
     assert area_result.new_module_file.exists()
     assert hello_result.new_module_file.exists()
+
+
+def test_split_function_preview_does_not_write_files(tmp_path: Path) -> None:
+    source = tmp_path / "main.py"
+    original = (
+        "import math\n\n"
+        "def area(r):\n"
+        "    return math.pi * r * r\n\n"
+        "def hello(name):\n"
+        "    return f'Hello, {name}'\n"
+    )
+    source.write_text(original, encoding="utf-8")
+
+    resolved = resolve_target(parse_target("main.area"), cwd=tmp_path)
+    result = split_function(resolved, preview=True)
+
+    assert result.preview is True
+    assert "from modules import area" in result.module_text
+    assert "def area(r):" in result.new_module_text
+    assert "from .area import area\n" == result.init_text
+    assert source.read_text(encoding="utf-8") == original
+    assert not result.new_module_file.exists()
+    assert not result.init_file.exists()

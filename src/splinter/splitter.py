@@ -9,11 +9,25 @@ from .resolver import ResolvedTarget
 
 
 @dataclass(slots=True)
+class FileChange:
+    path: Path
+    existed_before: bool
+    before_text: str
+    after_text: str
+
+
+@dataclass(slots=True)
 class SplitResult:
     module_file: Path
     new_module_file: Path
     function_name: str
     import_statement: str
+    module_text: str
+    new_module_text: str
+    init_file: Path
+    init_text: str
+    preview: bool
+    file_changes: list[FileChange]
 
 
 @dataclass(slots=True)
@@ -33,16 +47,17 @@ class ModuleAnalysis:
 
 
 
-def split_function(resolved: ResolvedTarget) -> SplitResult:
+def split_function(resolved: ResolvedTarget, *, preview: bool = False) -> SplitResult:
     source_text = resolved.module_file.read_text(encoding="utf-8")
     analysis = _analyze_module(source_text, resolved.spec.function_name, resolved.module_file)
 
     new_module_file = _build_new_module_file_path(resolved)
-    new_module_file.parent.mkdir(parents=True, exist_ok=True)
     init_file = new_module_file.parent / "__init__.py"
-    if not init_file.exists():
-        init_file.write_text("", encoding="utf-8")
-    _update_package_exports(init_file, resolved.spec.function_name)
+    new_module_existed_before = new_module_file.exists()
+    init_file_existed_before = init_file.exists()
+    existing_new_module_text = new_module_file.read_text(encoding="utf-8") if new_module_existed_before else ""
+    existing_init_text = init_file.read_text(encoding="utf-8") if init_file_existed_before else ""
+    init_text = _updated_package_exports(existing_init_text, resolved.spec.function_name)
 
     function_block = _extract_lines(
         analysis.source_text,
@@ -57,7 +72,6 @@ def split_function(resolved: ResolvedTarget) -> SplitResult:
         dependency_block=dependency_block,
         function_block=function_block,
     )
-    new_module_file.write_text(new_module_text, encoding="utf-8")
 
     updated_source = _remove_function_block(
         analysis.source_text,
@@ -66,13 +80,48 @@ def split_function(resolved: ResolvedTarget) -> SplitResult:
     )
     import_statement = _compute_replacement_import(resolved, new_module_file)
     updated_source = _insert_import(updated_source, import_statement)
-    resolved.module_file.write_text(updated_source, encoding="utf-8")
+
+    if not preview:
+        new_module_file.parent.mkdir(parents=True, exist_ok=True)
+        if init_text:
+            init_file.write_text(init_text, encoding="utf-8")
+        elif init_file.exists():
+            init_file.write_text("", encoding="utf-8")
+        new_module_file.write_text(new_module_text, encoding="utf-8")
+        resolved.module_file.write_text(updated_source, encoding="utf-8")
+
+    file_changes = [
+        FileChange(
+            path=resolved.module_file,
+            existed_before=True,
+            before_text=source_text,
+            after_text=updated_source,
+        ),
+        FileChange(
+            path=new_module_file,
+            existed_before=new_module_existed_before,
+            before_text=existing_new_module_text,
+            after_text=new_module_text,
+        ),
+        FileChange(
+            path=init_file,
+            existed_before=init_file_existed_before,
+            before_text=existing_init_text,
+            after_text=init_text,
+        ),
+    ]
 
     return SplitResult(
         module_file=resolved.module_file,
         new_module_file=new_module_file,
         function_name=resolved.spec.function_name,
         import_statement=import_statement,
+        module_text=updated_source,
+        new_module_text=new_module_text,
+        init_file=init_file,
+        init_text=init_text,
+        preview=preview,
+        file_changes=file_changes,
     )
 
 
@@ -175,17 +224,16 @@ def _rewrite_package_import(stmt: ast.ImportFrom, package_mode: bool) -> list[st
 
 
 
-def _update_package_exports(init_file: Path, function_name: str) -> None:
+def _updated_package_exports(existing: str, function_name: str) -> str:
     export_line = f"from .{function_name} import {function_name}\n"
-    existing = init_file.read_text(encoding="utf-8") if init_file.exists() else ""
     lines = existing.splitlines(keepends=True)
 
     if export_line in lines:
-        return
+        return existing
 
     lines.append(export_line)
     lines = sorted(set(lines), key=str.casefold)
-    init_file.write_text("".join(lines), encoding="utf-8")
+    return "".join(lines)
 
 
 

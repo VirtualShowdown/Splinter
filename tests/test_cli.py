@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from splinter.cli import main
@@ -90,3 +91,86 @@ def test_splitall_generated_modules_use_direct_submodule_imports(tmp_path: Path)
     assert "from modules.log_call import log_call" in compute_module
     assert "from modules.require_positive_numbers import require_positive_numbers" in compute_module
     assert "from modules import" not in compute_module
+
+
+def test_splitall_preview_does_not_write_files(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "main.py"
+    original = (
+        "def area(r):\n"
+        "    return r * r\n\n"
+        "def hello(name):\n"
+        "    return f'Hello, {name}'\n"
+    )
+    source.write_text(original, encoding="utf-8")
+
+    exit_code = main(["splitall", "main.py", "--cwd", str(tmp_path), "--preview"])
+
+    assert exit_code == 0
+    assert source.read_text(encoding="utf-8") == original
+    assert not (tmp_path / "modules").exists()
+
+    output = capsys.readouterr().out
+    assert "Would split 'area' successfully." in output
+    assert "Would split 'hello' successfully." in output
+    assert "Would split 2 function(s)." in output
+
+
+def test_undo_rolls_back_last_splitfunc_operation(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "main.py"
+    original = (
+        "import math\n\n"
+        "def area(r):\n"
+        "    return math.pi * r * r\n\n"
+        "def hello(name):\n"
+        "    return f'Hello, {name}'\n"
+    )
+    source.write_text(original, encoding="utf-8")
+
+    split_exit = main(["splitfunc", "main.area", "--cwd", str(tmp_path)])
+
+    assert split_exit == 0
+    assert (tmp_path / "modules" / "area.py").exists()
+    history_file = tmp_path / ".splinter_history.json"
+    history = json.loads(history_file.read_text(encoding="utf-8"))
+    assert len(history) == 1
+
+    undo_exit = main(["undo", "--cwd", str(tmp_path)])
+
+    assert undo_exit == 0
+    assert source.read_text(encoding="utf-8") == original
+    assert not (tmp_path / "modules").exists()
+    assert json.loads(history_file.read_text(encoding="utf-8")) == []
+
+    output = capsys.readouterr().out
+    assert "Rolled back 1 operation(s)." in output
+
+
+def test_undo_rolls_back_splitall_as_one_operation(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "main.py"
+    original = (
+        "def area(r):\n"
+        "    return r * r\n\n"
+        "def hello(name):\n"
+        "    return f'Hello, {name}'\n\n"
+        "def orchestrate(value, name):\n"
+        "    return area(value), hello(name)\n"
+    )
+    source.write_text(original, encoding="utf-8")
+
+    split_exit = main(["splitall", "main.py", "--cwd", str(tmp_path)])
+
+    assert split_exit == 0
+    history_file = tmp_path / ".splinter_history.json"
+    history = json.loads(history_file.read_text(encoding="utf-8"))
+    assert len(history) == 1
+
+    undo_exit = main(["undo", "--cwd", str(tmp_path)])
+
+    assert undo_exit == 0
+    assert source.read_text(encoding="utf-8") == original
+    assert not (tmp_path / "modules").exists()
+    assert json.loads(history_file.read_text(encoding="utf-8")) == []
+
+    output = capsys.readouterr().out
+    assert "Split 3 function(s)." in output
+    assert "Rolled back 1 operation(s)." in output
