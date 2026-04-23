@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import difflib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +18,13 @@ class FileChange:
 
 
 @dataclass(slots=True)
+class SplitOptions:
+    preview: bool = False
+    output_package: str = "modules"
+    validate: bool = False
+
+
+@dataclass(slots=True)
 class SplitResult:
     module_file: Path
     new_module_file: Path
@@ -28,6 +36,8 @@ class SplitResult:
     init_text: str
     preview: bool
     file_changes: list[FileChange]
+    output_package: str
+    preview_diffs: list[str]
 
 
 @dataclass(slots=True)
@@ -47,11 +57,30 @@ class ModuleAnalysis:
 
 
 
-def split_function(resolved: ResolvedTarget, *, preview: bool = False) -> SplitResult:
+def split_function(resolved: ResolvedTarget, *, options: SplitOptions | None = None, preview: bool | None = None) -> SplitResult:
+    if options is None:
+        options = SplitOptions()
+    if preview is not None:
+        options = SplitOptions(
+            preview=preview,
+            output_package=options.output_package,
+            validate=options.validate,
+        )
+    _validate_output_package(options.output_package)
+
     source_text = resolved.module_file.read_text(encoding="utf-8")
     analysis = _analyze_module(source_text, resolved.spec.function_name, resolved.module_file)
 
-    new_module_file = _build_new_module_file_path(resolved)
+    dependency_names = _collect_dependency_names(analysis.target.node, analysis.definitions)
+    dependency_names.discard(resolved.spec.function_name)
+    _detect_local_dependency_cycle(
+        resolved.spec.function_name,
+        dependency_names,
+        analysis.definitions,
+        resolved.module_file,
+    )
+
+    new_module_file = _build_new_module_file_path(resolved, options)
     init_file = new_module_file.parent / "__init__.py"
     new_module_existed_before = new_module_file.exists()
     init_file_existed_before = init_file.exists()
@@ -64,8 +93,13 @@ def split_function(resolved: ResolvedTarget, *, preview: bool = False) -> SplitR
         analysis.target.start_lineno,
         analysis.target.end_lineno,
     )
-    import_block = _build_import_block(analysis.imports, analysis.source_text, resolved.package_mode)
-    dependency_block = _build_dependency_block(analysis, resolved.spec.function_name)
+    import_block = _build_import_block(
+        analysis.imports,
+        analysis.source_text,
+        resolved.package_mode,
+        options.output_package,
+    )
+    dependency_block = _build_dependency_block(analysis, resolved.spec.function_name, dependency_names)
     new_module_text = _compose_new_module_text(
         source_path=resolved.module_file,
         import_block=import_block,
@@ -78,17 +112,8 @@ def split_function(resolved: ResolvedTarget, *, preview: bool = False) -> SplitR
         analysis.target.start_lineno,
         analysis.target.end_lineno,
     )
-    import_statement = _compute_replacement_import(resolved, new_module_file)
+    import_statement = _compute_replacement_import(resolved, options.output_package)
     updated_source = _insert_import(updated_source, import_statement)
-
-    if not preview:
-        new_module_file.parent.mkdir(parents=True, exist_ok=True)
-        if init_text:
-            init_file.write_text(init_text, encoding="utf-8")
-        elif init_file.exists():
-            init_file.write_text("", encoding="utf-8")
-        new_module_file.write_text(new_module_text, encoding="utf-8")
-        resolved.module_file.write_text(updated_source, encoding="utf-8")
 
     file_changes = [
         FileChange(
@@ -111,6 +136,18 @@ def split_function(resolved: ResolvedTarget, *, preview: bool = False) -> SplitR
         ),
     ]
 
+    if options.validate:
+        _validate_split_outputs(file_changes)
+
+    if not options.preview:
+        new_module_file.parent.mkdir(parents=True, exist_ok=True)
+        if init_text:
+            init_file.write_text(init_text, encoding="utf-8")
+        elif init_file.exists():
+            init_file.write_text("", encoding="utf-8")
+        new_module_file.write_text(new_module_text, encoding="utf-8")
+        resolved.module_file.write_text(updated_source, encoding="utf-8")
+
     return SplitResult(
         module_file=resolved.module_file,
         new_module_file=new_module_file,
@@ -120,8 +157,10 @@ def split_function(resolved: ResolvedTarget, *, preview: bool = False) -> SplitR
         new_module_text=new_module_text,
         init_file=init_file,
         init_text=init_text,
-        preview=preview,
+        preview=options.preview,
         file_changes=file_changes,
+        output_package=options.output_package,
+        preview_diffs=_build_preview_diffs(file_changes),
     )
 
 
@@ -177,8 +216,9 @@ def _analyze_module(source_text: str, function_name: str, module_file: Path) -> 
 
 
 
-def _build_new_module_file_path(resolved: ResolvedTarget) -> Path:
-    return resolved.module_file.parent / "modules" / f"{resolved.spec.function_name}.py"
+def _build_new_module_file_path(resolved: ResolvedTarget, options: SplitOptions) -> Path:
+    package_parts = options.output_package.split(".")
+    return resolved.module_file.parent.joinpath(*package_parts) / f"{resolved.spec.function_name}.py"
 
 
 
@@ -188,12 +228,17 @@ def _extract_lines(source_text: str, start_lineno: int, end_lineno: int) -> str:
 
 
 
-def _build_import_block(imports: list[ast.stmt], source_text: str, package_mode: bool) -> str:
+def _build_import_block(
+    imports: list[ast.stmt],
+    source_text: str,
+    package_mode: bool,
+    output_package: str,
+) -> str:
     lines = source_text.splitlines(keepends=True)
     blocks: list[str] = []
     for stmt in imports:
-        if isinstance(stmt, ast.ImportFrom) and stmt.module == "modules":
-            blocks.extend(_rewrite_package_import(stmt, package_mode))
+        if isinstance(stmt, ast.ImportFrom) and stmt.module == output_package:
+            blocks.extend(_rewrite_package_import(stmt, package_mode, output_package))
             continue
 
         if stmt.end_lineno is None:
@@ -206,19 +251,24 @@ def _build_import_block(imports: list[ast.stmt], source_text: str, package_mode:
 
 
 
-def _rewrite_package_import(stmt: ast.ImportFrom, package_mode: bool) -> list[str]:
-    prefix = "." if package_mode else ""
+def _rewrite_package_import(stmt: ast.ImportFrom, package_mode: bool, output_package: str) -> list[str]:
     rewritten: list[str] = []
 
     for alias in sorted(stmt.names, key=lambda item: item.name.casefold()):
         import_name = alias.name
         if alias.asname is None:
-            rewritten.append(f"from {prefix}modules.{import_name} import {import_name}")
+            if package_mode:
+                rewritten.append(f"from .{import_name} import {import_name}")
+            else:
+                rewritten.append(f"from {output_package}.{import_name} import {import_name}")
             continue
 
-        rewritten.append(
-            f"from {prefix}modules.{import_name} import {import_name} as {alias.asname}"
-        )
+        if package_mode:
+            rewritten.append(f"from .{import_name} import {import_name} as {alias.asname}")
+        else:
+            rewritten.append(
+                f"from {output_package}.{import_name} import {import_name} as {alias.asname}"
+            )
 
     return rewritten
 
@@ -237,9 +287,13 @@ def _updated_package_exports(existing: str, function_name: str) -> str:
 
 
 
-def _build_dependency_block(analysis: ModuleAnalysis, function_name: str) -> str:
+def _build_dependency_block(
+    analysis: ModuleAnalysis,
+    function_name: str,
+    dependency_names: set[str] | None = None,
+) -> str:
     lines = analysis.source_text.splitlines(keepends=True)
-    dependency_names = _collect_dependency_names(analysis.target.node, analysis.definitions)
+    dependency_names = set(dependency_names or _collect_dependency_names(analysis.target.node, analysis.definitions))
     dependency_names.discard(function_name)
 
     blocks: list[tuple[int, str]] = []
@@ -279,6 +333,45 @@ def _compose_new_module_text(
     return header + import_block + dependency_block + function_block
 
 
+def _validate_output_package(output_package: str) -> None:
+    parts = output_package.split(".")
+    if not output_package or any(not part.isidentifier() for part in parts):
+        raise FunctionExtractionError(
+            f"Invalid output package '{output_package}'. Use a dotted Python package path like 'modules' or 'generated'."
+        )
+
+
+def _validate_split_outputs(file_changes: list[FileChange]) -> None:
+    for change in file_changes:
+        if not change.after_text:
+            continue
+        try:
+            ast.parse(change.after_text)
+        except SyntaxError as exc:
+            raise FunctionExtractionError(
+                f"Validation failed for '{change.path.name}': {exc.msg} at line {exc.lineno}."
+            ) from exc
+
+
+def _build_preview_diffs(file_changes: list[FileChange]) -> list[str]:
+    diffs: list[str] = []
+    for change in file_changes:
+        before = change.before_text.splitlines()
+        after = change.after_text.splitlines()
+        diff_lines = list(
+            difflib.unified_diff(
+                before,
+                after,
+                fromfile=str(change.path),
+                tofile=str(change.path),
+                lineterm="",
+            )
+        )
+        if diff_lines:
+            diffs.append("\n".join(diff_lines))
+    return diffs
+
+
 
 def _collect_dependency_names(
     node: ast.FunctionDef | ast.AsyncFunctionDef,
@@ -299,6 +392,50 @@ def _collect_dependency_names(
                 pending.append(dependency)
 
     return collected
+
+
+def _detect_local_dependency_cycle(
+    function_name: str,
+    dependency_names: set[str],
+    definitions: dict[str, ast.stmt],
+    module_file: Path,
+) -> None:
+    for dependency_name in sorted(dependency_names):
+        path = _find_dependency_path_to_target(dependency_name, function_name, definitions)
+        if path is None:
+            continue
+
+        cycle_path = " -> ".join([function_name, *path])
+        raise FunctionExtractionError(
+            f"Cannot split '{function_name}' from '{module_file}' because it participates in a local dependency cycle: {cycle_path}."
+        )
+
+
+def _find_dependency_path_to_target(
+    start_name: str,
+    target_name: str,
+    definitions: dict[str, ast.stmt],
+) -> list[str] | None:
+    stack: list[tuple[str, list[str]]] = [(start_name, [start_name])]
+    visited: set[str] = set()
+
+    while stack:
+        current_name, path = stack.pop()
+        if current_name in visited:
+            continue
+        visited.add(current_name)
+
+        stmt = definitions.get(current_name)
+        if stmt is None:
+            continue
+
+        for dependency in sorted(_find_module_level_references(stmt)):
+            if dependency == target_name:
+                return path + [target_name]
+            if dependency in definitions and dependency not in visited:
+                stack.append((dependency, path + [dependency]))
+
+    return None
 
 
 
@@ -475,11 +612,10 @@ def _remove_function_block(source_text: str, start_lineno: int, end_lineno: int)
 
 
 
-def _compute_replacement_import(resolved: ResolvedTarget, new_module_file: Path) -> str:
-    del new_module_file
+def _compute_replacement_import(resolved: ResolvedTarget, output_package: str) -> str:
     if resolved.package_mode:
-        return f"from .modules import {resolved.spec.function_name}"
-    return f"from modules import {resolved.spec.function_name}"
+        return f"from .{output_package} import {resolved.spec.function_name}"
+    return f"from {output_package} import {resolved.spec.function_name}"
 
 
 
@@ -520,7 +656,7 @@ def _merge_with_existing_package_import(
     import_statement: str,
 ) -> str | None:
     parsed_import = ast.parse(import_statement).body[0]
-    if not isinstance(parsed_import, ast.ImportFrom) or parsed_import.module != "modules":
+    if not isinstance(parsed_import, ast.ImportFrom) or parsed_import.module is None:
         return None
 
     body = getattr(tree, "body", [])

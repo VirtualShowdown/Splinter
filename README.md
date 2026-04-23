@@ -77,6 +77,9 @@ Splinter splitall --dir <directory>
 Splinter undo [count]
 Splinter splitfunc <module>.<function> --preview
 Splinter splitall <path/to/file.py> --preview
+Splinter splitfunc <module>.<function> --validate
+Splinter splitall <path/to/file.py> --public-only --exclude main,_*
+Splinter splitfunc <module>.<function> --output-package generated
 ```
 
 Examples:
@@ -87,6 +90,9 @@ uv run Splinter splitfunc package.utils.normalize_name
 uv run Splinter splitall main.py
 uv run Splinter splitall --dir app
 uv run Splinter splitall main.py --preview
+uv run Splinter splitall main.py --public-only --exclude main,_*
+uv run Splinter splitfunc main.area --validate
+uv run Splinter splitfunc main.area --output-package generated
 uv run Splinter undo
 ```
 
@@ -94,7 +100,11 @@ uv run Splinter undo
 
 - Splinter only moves top-level functions.
 - `splitall` is literal: it will split every top-level function it finds, including helper functions and `main()` if present.
-- Use `--preview` to inspect the planned file changes before Splinter writes anything.
+- Use `--preview` to inspect planned edits with unified diffs before Splinter writes anything.
+- Use `--validate` to make Splinter parse the generated Python source before it writes changes.
+- Use `--include`, `--exclude`, and `--public-only` to make `splitall` selective instead of splitting every top-level function.
+- Use `--output-package` if you want generated modules somewhere other than `modules/`.
+- Splinter now refuses to split functions that participate in a local top-level dependency cycle, such as simple mutual recursion.
 - Every non-preview split records rollback history in `.splinter_history.json`, and `undo` replays the last recorded operation.
 - The generated `modules/` package is part of the rewritten code, not just scratch output.
 

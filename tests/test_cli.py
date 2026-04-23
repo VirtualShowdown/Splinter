@@ -113,6 +113,88 @@ def test_splitall_preview_does_not_write_files(tmp_path: Path, capsys) -> None:
     assert "Would split 'area' successfully." in output
     assert "Would split 'hello' successfully." in output
     assert "Would split 2 function(s)." in output
+    assert "@@" in output
+    assert "+from modules import area" in output
+
+
+def test_splitall_supports_include_exclude_and_public_only_filters(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "main.py"
+    source.write_text(
+        "def public_alpha():\n"
+        "    return 'a'\n\n"
+        "def public_beta():\n"
+        "    return 'b'\n\n"
+        "def main():\n"
+        "    return public_alpha(), public_beta()\n\n"
+        "def _helper():\n"
+        "    return 'hidden'\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "splitall",
+            "main.py",
+            "--cwd",
+            str(tmp_path),
+            "--public-only",
+            "--include",
+            "public_*",
+            "--exclude",
+            "*beta",
+        ]
+    )
+
+    assert exit_code == 0
+    updated = source.read_text(encoding="utf-8")
+    assert "from modules import public_alpha" in updated
+    assert "public_beta" in updated
+    assert "def _helper" in updated
+    assert not (tmp_path / "modules" / "public_beta.py").exists()
+    assert (tmp_path / "modules" / "public_alpha.py").exists()
+
+    output = capsys.readouterr().out
+    assert "Split 1 function(s)." in output
+
+
+def test_splitfunc_supports_custom_output_package(tmp_path: Path) -> None:
+    source = tmp_path / "main.py"
+    source.write_text(
+        "def area(r):\n"
+        "    return r * r\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["splitfunc", "main.area", "--cwd", str(tmp_path), "--output-package", "generated"])
+
+    assert exit_code == 0
+    assert "from generated import area" in source.read_text(encoding="utf-8")
+    assert (tmp_path / "generated" / "area.py").exists()
+    assert (tmp_path / "generated" / "__init__.py").exists()
+
+
+def test_splitfunc_validate_rejects_invalid_generated_output(tmp_path: Path, monkeypatch, capsys) -> None:
+    source = tmp_path / "main.py"
+    original = (
+        "def area(r):\n"
+        "    return r * r\n"
+    )
+    source.write_text(original, encoding="utf-8")
+
+    def broken_insert_import(source_text: str, import_statement: str) -> str:
+        del import_statement
+        return source_text + "\nthis is not valid python(\n"
+
+    monkeypatch.setattr("splinter.splitter._insert_import", broken_insert_import)
+
+    exit_code = main(["splitfunc", "main.area", "--cwd", str(tmp_path), "--validate"])
+
+    assert exit_code == 1
+    assert source.read_text(encoding="utf-8") == original
+    assert not (tmp_path / "modules").exists()
+
+    output = capsys.readouterr().out
+    assert "Validation failed" in output
 
 
 def test_undo_rolls_back_last_splitfunc_operation(tmp_path: Path, capsys) -> None:

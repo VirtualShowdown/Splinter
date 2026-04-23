@@ -10,7 +10,7 @@ readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "VirtualShowdown" }]
 requires-python = ">=3.12"
-dependencies = ["pytest>=9.0.3"]
+dependencies = ["colorama>=0.4.6", "pytest>=9.0.3"]
 
 [project.scripts]
 Splinter = "splinter.cli:main"

@@ -68,8 +68,12 @@ name = "splinter"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "colorama" },
     { name = "pytest" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "pytest", specifier = ">=9.0.3" }]
+requires-dist = [
+    { name = "colorama", specifier = ">=0.4.6" },
+    { name = "pytest", specifier = ">=9.0.3" },
+]

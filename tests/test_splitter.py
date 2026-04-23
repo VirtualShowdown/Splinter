@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from splinter.resolver import parse_target, resolve_target
+from splinter.exceptions import FunctionExtractionError
 from splinter.splitter import split_function
 
 
@@ -152,3 +155,24 @@ def test_split_function_preview_does_not_write_files(tmp_path: Path) -> None:
     assert source.read_text(encoding="utf-8") == original
     assert not result.new_module_file.exists()
     assert not result.init_file.exists()
+
+
+def test_split_function_rejects_local_dependency_cycles(tmp_path: Path) -> None:
+    source = tmp_path / "main.py"
+    original = (
+        "def alpha(value):\n"
+        "    return beta(value)\n\n"
+        "def beta(value):\n"
+        "    if value <= 0:\n"
+        "        return value\n"
+        "    return alpha(value - 1)\n"
+    )
+    source.write_text(original, encoding="utf-8")
+
+    resolved = resolve_target(parse_target("main.alpha"), cwd=tmp_path)
+
+    with pytest.raises(FunctionExtractionError, match="local dependency cycle"):
+        split_function(resolved)
+
+    assert source.read_text(encoding="utf-8") == original
+    assert not (tmp_path / "modules").exists()

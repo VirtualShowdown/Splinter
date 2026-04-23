@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import ast
 import argparse
+import fnmatch
+import os
+import sys
 from pathlib import Path
+
+from colorama import Fore, Style, just_fix_windows_console
 
 from .exceptions import PySplitError
 from .history import record_split_history, rollback_last
 from .resolver import TargetSpec, parse_target, resolve_target
-from .splitter import split_function
+from .splitter import SplitOptions, split_function
 from .utils import path_to_module_parts
+
+just_fix_windows_console()
 
 
 
@@ -37,6 +44,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Show the planned changes without writing files.",
     )
+    splitfunc.add_argument(
+        "--validate",
+        action="store_true",
+        help="Validate the generated Python source before writing files.",
+    )
+    splitfunc.add_argument(
+        "--output-package",
+        default="modules",
+        help="Package name to create extracted modules in. Defaults to 'modules'.",
+    )
 
     splitall = subparsers.add_parser(
         "splitall",
@@ -61,6 +78,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--preview",
         action="store_true",
         help="Show the planned changes without writing files.",
+    )
+    splitall.add_argument(
+        "--validate",
+        action="store_true",
+        help="Validate the generated Python source before writing files.",
+    )
+    splitall.add_argument(
+        "--output-package",
+        default="modules",
+        help="Package name to create extracted modules in. Defaults to 'modules'.",
+    )
+    splitall.add_argument(
+        "--include",
+        help="Comma-separated function name patterns to include, like 'main,run_*'.",
+    )
+    splitall.add_argument(
+        "--exclude",
+        help="Comma-separated function name patterns to exclude, like 'main,_*'.",
+    )
+    splitall.add_argument(
+        "--public-only",
+        action="store_true",
+        help="Only split public top-level functions whose names do not start with an underscore.",
     )
 
     undo = subparsers.add_parser(
@@ -93,7 +133,8 @@ def main(argv: list[str] | None = None) -> int:
             cwd = Path(args.cwd)
             spec = parse_target(args.target)
             resolved = resolve_target(spec, cwd=cwd)
-            result = split_function(resolved, preview=args.preview)
+            options = _build_split_options(args)
+            result = split_function(resolved, options=options)
             _print_split_result(result)
             print(f"Updated: {result.module_file}")
             print(f"Created: {result.new_module_file}")
@@ -104,7 +145,16 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "splitall":
             cwd = Path(args.cwd)
-            split_count = _split_all(args.path, args.directory, cwd, preview=args.preview)
+            options = _build_split_options(args)
+            split_count = _split_all(
+                args.path,
+                args.directory,
+                cwd,
+                options=options,
+                include_patterns=_parse_patterns(args.include),
+                exclude_patterns=_parse_patterns(args.exclude),
+                public_only=args.public_only,
+            )
             if split_count == 0:
                 print("No top-level functions found.")
             else:
@@ -125,17 +175,33 @@ def main(argv: list[str] | None = None) -> int:
 
 
 
-def _split_all(path_arg: str | None, directory_arg: str | None, cwd: Path, *, preview: bool) -> int:
+def _split_all(
+    path_arg: str | None,
+    directory_arg: str | None,
+    cwd: Path,
+    *,
+    options: SplitOptions,
+    include_patterns: list[str],
+    exclude_patterns: list[str],
+    public_only: bool,
+) -> int:
     target_files = _resolve_splitall_files(path_arg, directory_arg, cwd)
     split_count = 0
     results = []
 
     for file_path in target_files:
-        file_results = _split_all_in_file(file_path, cwd, preview=preview)
+        file_results = _split_all_in_file(
+            file_path,
+            cwd,
+            options=options,
+            include_patterns=include_patterns,
+            exclude_patterns=exclude_patterns,
+            public_only=public_only,
+        )
         results.extend(file_results)
         split_count += len(file_results)
 
-    if results and not preview:
+    if results and not options.preview:
         descriptor = path_arg if path_arg else f"--dir {directory_arg}"
         history_file = record_split_history(cwd, f"splitall {descriptor}", results)
         print(f"Recorded rollback history: {history_file}")
@@ -169,15 +235,28 @@ def _resolve_splitall_files(path_arg: str | None, directory_arg: str | None, cwd
 
 
 
-def _split_all_in_file(file_path: Path, cwd: Path, *, preview: bool) -> list:
-    function_names = _list_top_level_function_names(file_path)
+def _split_all_in_file(
+    file_path: Path,
+    cwd: Path,
+    *,
+    options: SplitOptions,
+    include_patterns: list[str],
+    exclude_patterns: list[str],
+    public_only: bool,
+) -> list:
+    function_names = _list_top_level_function_names(
+        file_path,
+        include_patterns=include_patterns,
+        exclude_patterns=exclude_patterns,
+        public_only=public_only,
+    )
     module_path = _module_path_from_file(file_path, cwd)
     results = []
 
     for function_name in function_names:
         spec = TargetSpec(module_path=module_path, function_name=function_name)
         resolved = resolve_target(spec, cwd=cwd)
-        result = split_function(resolved, preview=preview)
+        result = split_function(resolved, options=options)
         results.append(result)
         _print_split_result(result)
         print(f"Updated: {result.module_file}")
@@ -188,17 +267,36 @@ def _split_all_in_file(file_path: Path, cwd: Path, *, preview: bool) -> list:
 
 
 
-def _list_top_level_function_names(file_path: Path) -> list[str]:
+def _list_top_level_function_names(
+    file_path: Path,
+    *,
+    include_patterns: list[str],
+    exclude_patterns: list[str],
+    public_only: bool,
+) -> list[str]:
     try:
         tree = ast.parse(file_path.read_text(encoding="utf-8"))
     except SyntaxError as exc:
         raise PySplitError(f"Could not parse '{file_path}': {exc}") from exc
 
-    return [
+    function_names = [
         stmt.name
         for stmt in tree.body
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
     ]
+
+    if public_only:
+        function_names = [name for name in function_names if not name.startswith("_")]
+    if include_patterns:
+        function_names = [
+            name for name in function_names if any(fnmatch.fnmatchcase(name, pattern) for pattern in include_patterns)
+        ]
+    if exclude_patterns:
+        function_names = [
+            name for name in function_names if not any(fnmatch.fnmatchcase(name, pattern) for pattern in exclude_patterns)
+        ]
+
+    return function_names
 
 
 
@@ -213,4 +311,52 @@ def _module_path_from_file(file_path: Path, cwd: Path) -> str:
 
 def _print_split_result(result) -> None:
     action = "Would split" if result.preview else "Split"
-    print(f"{action} '{result.function_name}' successfully.")
+    verb = _color_text(action, Fore.CYAN if result.preview else Fore.GREEN)
+    function_name = _color_text(result.function_name, Fore.MAGENTA)
+    print(f"{verb} '{function_name}' successfully.")
+    if result.preview:
+        for diff in result.preview_diffs:
+            _print_preview_diff(diff)
+
+
+def _parse_patterns(raw_patterns: str | None) -> list[str]:
+    if raw_patterns is None:
+        return []
+    return [pattern.strip() for pattern in raw_patterns.split(",") if pattern.strip()]
+
+
+def _build_split_options(args: argparse.Namespace) -> SplitOptions:
+    return SplitOptions(
+        preview=args.preview,
+        output_package=args.output_package,
+        validate=args.validate,
+    )
+
+
+def _print_preview_diff(diff: str) -> None:
+    for line in diff.splitlines():
+        print(_colorize_diff_line(line))
+
+
+def _colorize_diff_line(line: str) -> str:
+    if line.startswith("+++") or line.startswith("---"):
+        return _color_text(line, Fore.CYAN)
+    if line.startswith("@@"):
+        return _color_text(line, Fore.YELLOW)
+    if line.startswith("+"):
+        return _color_text(line, Fore.GREEN)
+    if line.startswith("-"):
+        return _color_text(line, Fore.RED)
+    return line
+
+
+def _color_text(text: str, color: str) -> str:
+    if not _supports_color():
+        return text
+    return f"{color}{text}{Style.RESET_ALL}"
+
+
+def _supports_color() -> bool:
+    if os.getenv("NO_COLOR"):
+        return False
+    return sys.stdout.isatty()
