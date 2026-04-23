@@ -116,6 +116,8 @@ Run tests with:
 uv run python -m pytest tests --basetemp .pytest_tmp
 ```
 
-## CONTRIBUTION
+## _CONTRIBUTION_
 
+<b>
 Feel free to give feedback and/or suggest changes. This is just meant to be a helpful tool for larger projects made for fun.
+</b>
