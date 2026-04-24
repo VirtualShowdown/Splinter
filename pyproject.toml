@@ -4,16 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "manasplice"
-version = "0.1.0.3-alpha"
+version = "0.1.0.4-alpha"
 description = "Split top-level Python functions into dedicated modules and rewire imports automatically."
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "VirtualShowdown" }]
 requires-python = ">=3.12"
-dependencies = [
-    "colorama>=0.4.6",
-    "libcst>=1.8.6",
-]
+dependencies = ["colorama>=0.4.6", "libcst>=1.8.6"]
 
 [project.scripts]
 manasplice = "manasplice.cli:main"
