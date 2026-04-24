@@ -14,6 +14,7 @@ from .exceptions import PySplitError
 from .history import record_split_history, rollback_last
 from .resolver import TargetSpec, parse_target, resolve_target
 from .splitter import (
+    FileChange,
     GroupSplitResult,
     SplitOptions,
     SplitResult,
@@ -141,6 +142,67 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
         related=config.get("related", False),
     )
 
+    check = subparsers.add_parser(
+        "check",
+        help="Inspect whether a split can be applied without writing files",
+    )
+    check.add_argument(
+        "target_or_path",
+        nargs="?",
+        help="Target like module.function, or a Python file for splitall-style checks.",
+    )
+    check.add_argument(
+        "--dir",
+        dest="directory",
+        help="Directory whose top-level Python files should be checked.",
+    )
+    check.add_argument(
+        "--cwd",
+        default=".",
+        help="Project root to resolve from. Defaults to current directory.",
+    )
+    check.add_argument(
+        "--validate",
+        action="store_true",
+        help="Validate the generated Python source during the check.",
+    )
+    check.add_argument(
+        "--output-package",
+        default="modules",
+        help="Package name to create extracted modules in. Defaults to 'modules'.",
+    )
+    check.add_argument(
+        "--include",
+        help="Comma-separated function name patterns to include when checking files.",
+    )
+    check.add_argument(
+        "--exclude",
+        help="Comma-separated function name patterns to exclude when checking files.",
+    )
+    check.add_argument(
+        "--public-only",
+        action="store_true",
+        help="Only check public top-level functions whose names do not start with an underscore.",
+    )
+    check.add_argument(
+        "--related",
+        action="store_true",
+        help="Check related functions as grouped output modules.",
+    )
+    check.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow checks to pass when an output module already exists.",
+    )
+    check.set_defaults(
+        output_package=config.get("output_package", "modules"),
+        validate=config.get("validate", False),
+        public_only=config.get("public_only", False),
+        include=config.get("include"),
+        exclude=config.get("exclude"),
+        related=config.get("related", False),
+    )
+
     undo = subparsers.add_parser(
         "undo",
         help="Roll back the last split operation",
@@ -178,7 +240,7 @@ def main(argv: list[str] | None = None) -> int:
             resolved = resolve_target(spec, cwd=cwd)
             options = _build_split_options(args)
             result = split_function(resolved, options=options)
-            _print_split_result(result)
+            _print_split_result(result, show_diffs=args.preview)
             print(f"Updated: {result.module_file}")
             print(f"Created: {result.new_module_file}")
             print(f"Inserted import: {result.import_statement}")
@@ -205,6 +267,24 @@ def main(argv: list[str] | None = None) -> int:
                 action = "Would split" if args.preview else "Split"
                 print(f"{action} {split_count} function(s).")
             return 0
+        if args.command == "check":
+            cwd = Path(args.cwd)
+            options = _build_split_options(args, preview=True)
+            check_count = _check(
+                args.target_or_path,
+                args.directory,
+                cwd,
+                options=options,
+                include_patterns=_parse_patterns(args.include),
+                exclude_patterns=_parse_patterns(args.exclude),
+                public_only=args.public_only,
+                related=args.related,
+            )
+            if check_count == 0:
+                print("Check passed: no top-level functions found.")
+            else:
+                print(f"Check passed: {check_count} function(s) can be split.")
+            return 0
         if args.command == "undo":
             undo_count, history_file = rollback_last(Path(args.cwd), args.count)
             print(f"Rolled back {undo_count} operation(s).")
@@ -228,6 +308,7 @@ def _split_all(
     exclude_patterns: list[str],
     public_only: bool,
     related: bool = False,
+    show_diffs: bool = True,
 ) -> int:
     target_files = _resolve_splitall_files(path_arg, directory_arg, cwd)
     split_count = 0
@@ -242,6 +323,7 @@ def _split_all(
             exclude_patterns=exclude_patterns,
             public_only=public_only,
             related=related,
+            show_diffs=show_diffs,
         )
         results.extend(file_results)
         split_count += sum(len(r.function_names) if isinstance(r, GroupSplitResult) else 1 for r in file_results)
@@ -252,6 +334,40 @@ def _split_all(
         print(f"Recorded rollback history: {history_file}")
 
     return split_count
+
+
+def _check(
+    target_or_path: str | None,
+    directory_arg: str | None,
+    cwd: Path,
+    *,
+    options: SplitOptions,
+    include_patterns: list[str],
+    exclude_patterns: list[str],
+    public_only: bool,
+    related: bool,
+) -> int:
+    if directory_arg or _looks_like_file_path(target_or_path):
+        return _split_all(
+            target_or_path,
+            directory_arg,
+            cwd,
+            options=options,
+            include_patterns=include_patterns,
+            exclude_patterns=exclude_patterns,
+            public_only=public_only,
+            related=related,
+            show_diffs=False,
+        )
+
+    if not target_or_path:
+        raise PySplitError("check requires a target, a Python file path, or --dir.")
+
+    spec = parse_target(target_or_path)
+    resolved = resolve_target(spec, cwd=cwd)
+    result = split_function(resolved, options=options)
+    _print_split_result(result, show_diffs=False)
+    return 1
 
 
 def _resolve_splitall_files(path_arg: str | None, directory_arg: str | None, cwd: Path) -> list[Path]:
@@ -283,7 +399,8 @@ def _split_all_in_file(
     exclude_patterns: list[str],
     public_only: bool,
     related: bool = False,
-) -> list:
+    show_diffs: bool = True,
+) -> list[SplitResult | GroupSplitResult]:
     function_names = _list_top_level_function_names(
         file_path,
         include_patterns=include_patterns,
@@ -299,7 +416,7 @@ def _split_all_in_file(
             resolved = resolve_target(spec, cwd=cwd)
             result = split_function(resolved, options=options)
             results.append(result)
-            _print_split_result(result)
+            _print_split_result(result, show_diffs=show_diffs)
             print(f"Updated: {result.module_file}")
             print(f"Created: {result.new_module_file}")
             print(f"Inserted import: {result.import_statement}")
@@ -316,7 +433,7 @@ def _split_all_in_file(
             resolved = resolve_target(spec, cwd=cwd)
             result = split_function(resolved, options=options)
             results.append(result)
-            _print_split_result(result)
+            _print_split_result(result, show_diffs=show_diffs)
             print(f"Updated: {result.module_file}")
             print(f"Created: {result.new_module_file}")
             print(f"Inserted import: {result.import_statement}")
@@ -326,7 +443,7 @@ def _split_all_in_file(
             resolved = resolve_target(spec, cwd=cwd)
             group_result = split_group(resolved, group, options=options)
             results.append(group_result)
-            _print_group_result(group_result)
+            _print_group_result(group_result, show_diffs=show_diffs)
 
     return results
 
@@ -368,22 +485,40 @@ def _module_path_from_file(file_path: Path, cwd: Path) -> str:
         raise PySplitError(f"File '{file_path}' is not inside the configured cwd '{cwd.resolve()}'.") from exc
 
 
-def _print_split_result(result) -> None:
+def _print_split_result(result: SplitResult, *, show_diffs: bool = True) -> None:
     action = "Would split" if result.preview else "Split"
     verb = _color_text(action, Fore.CYAN if result.preview else Fore.GREEN)
     function_name = _color_text(result.function_name, Fore.MAGENTA)
     print(f"{verb} '{function_name}' successfully.")
     if result.preview:
+        _print_change_plan(
+            functions=[result.function_name],
+            module_file=result.module_file,
+            new_module_file=result.new_module_file,
+            import_statement=result.import_statement,
+            file_changes=result.file_changes,
+            output_package=result.output_package,
+        )
+    if result.preview and show_diffs:
         for diff in result.preview_diffs:
             _print_preview_diff(diff)
 
 
-def _print_group_result(result: GroupSplitResult) -> None:
+def _print_group_result(result: GroupSplitResult, *, show_diffs: bool = True) -> None:
     action = "Would split" if result.preview else "Split"
     verb = _color_text(action, Fore.CYAN if result.preview else Fore.GREEN)
     names_str = _color_text(", ".join(f"'{n}'" for n in result.function_names), Fore.MAGENTA)
     print(f"{verb} related group [{names_str}] -> {result.new_module_file.name}")
     if result.preview:
+        _print_change_plan(
+            functions=result.function_names,
+            module_file=result.module_file,
+            new_module_file=result.new_module_file,
+            import_statement=result.import_statement,
+            file_changes=result.file_changes,
+            output_package=result.output_package,
+        )
+    if result.preview and show_diffs:
         for diff in result.preview_diffs:
             _print_preview_diff(diff)
     print(f"Updated: {result.module_file}")
@@ -399,13 +534,48 @@ def _parse_patterns(raw_patterns: str | list | None) -> list[str]:
     return [pattern.strip() for pattern in raw_patterns.split(",") if pattern.strip()]
 
 
-def _build_split_options(args: argparse.Namespace) -> SplitOptions:
+def _build_split_options(args: argparse.Namespace, *, preview: bool | None = None) -> SplitOptions:
     return SplitOptions(
-        preview=args.preview,
+        preview=args.preview if preview is None else preview,
         output_package=args.output_package,
         validate=args.validate,
         force=args.force,
     )
+
+
+def _looks_like_file_path(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.endswith(".py") or "/" in value or "\\" in value
+
+
+def _print_change_plan(
+    *,
+    functions: list[str],
+    module_file: Path,
+    new_module_file: Path,
+    import_statement: str,
+    file_changes: list[FileChange],
+    output_package: str,
+) -> None:
+    creates = [change.path for change in file_changes if not change.existed_before]
+    updates = [change.path for change in file_changes if change.existed_before]
+    overwrites = [
+        change.path for change in file_changes if change.existed_before and change.path == new_module_file
+    ]
+
+    print("Plan:")
+    print(f"  Functions: {', '.join(functions)}")
+    print(f"  Source: {module_file}")
+    print(f"  Output module: {new_module_file}")
+    print(f"  Output package: {output_package}")
+    print(f"  Import inserted: {import_statement}")
+    if creates:
+        print(f"  Create: {', '.join(str(path) for path in creates)}")
+    if updates:
+        print(f"  Update: {', '.join(str(path) for path in updates)}")
+    if overwrites:
+        print(f"  Overwrite: {', '.join(str(path) for path in overwrites)}")
 
 
 def _print_preview_diff(diff: str) -> None:

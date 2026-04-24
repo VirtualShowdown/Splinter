@@ -8,6 +8,7 @@ It creates a `modules/` package next to the source file, moves the function ther
 
 - Splits one top-level function with `splitfunc`.
 - Splits every top-level function in a file, or every top-level function in each Python file in a directory, with `splitall`.
+- Checks whether a split is safe, and shows the planned changes without writing files, with `check`.
 - Copies the imports and top-level definitions the extracted function needs.
 - Maintains `modules/__init__.py` so rewritten files can use a single merged import line.
 
@@ -74,6 +75,9 @@ uv run splinter --help
 splinter splitfunc <module>.<function>
 splinter splitall <path/to/file.py>
 splinter splitall --dir <directory>
+splinter check <module>.<function>
+splinter check <path/to/file.py>
+splinter check --dir <directory>
 splinter undo [count]
 splinter splitfunc <module>.<function> --preview
 splinter splitall <path/to/file.py> --preview
@@ -90,6 +94,8 @@ uv run splinter splitfunc main.area
 uv run splinter splitfunc package.utils.normalize_name
 uv run splinter splitall main.py
 uv run splinter splitall --dir app
+uv run splinter check main.area
+uv run splinter check main.py --public-only --exclude main,_*
 uv run splinter splitall main.py --preview
 uv run splinter splitall main.py --public-only --exclude main,_*
 uv run splinter splitfunc main.area --validate
@@ -101,7 +107,8 @@ uv run splinter undo
 
 - Splinter only moves top-level functions.
 - `splitall` is literal: it will split every top-level function it finds, including helper functions and `main()` if present.
-- Use `--preview` to inspect planned edits with unified diffs before Splinter writes anything.
+- Use `check` for a no-write safety report without diffs.
+- Use `--preview` to inspect planned edits with a safety report and unified diffs before Splinter writes anything.
 - Use `--validate` to make Splinter parse the generated Python source before it writes changes.
 - Use `--include`, `--exclude`, and `--public-only` to make `splitall` selective instead of splitting every top-level function.
 - Use `--output-package` if you want generated modules somewhere other than `modules/`.

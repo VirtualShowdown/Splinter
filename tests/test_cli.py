@@ -117,10 +117,62 @@ def test_splitall_preview_does_not_write_files(tmp_path: Path, capsys) -> None:
 
     output = capsys.readouterr().out
     assert "Would split 'area' successfully." in output
+    assert "Plan:" in output
+    assert "Functions: area" in output
+    assert "Output module:" in output
+    assert "Create:" in output
     assert "Would split 'hello' successfully." in output
     assert "Would split 2 function(s)." in output
     assert "@@" in output
     assert "+from modules import area" in output
+
+
+def test_check_splitfunc_reports_plan_without_writing(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "main.py"
+    original = "def area(r):\n    return r * r\n"
+    source.write_text(original, encoding="utf-8")
+
+    exit_code = main(["check", "main.area", "--cwd", str(tmp_path)])
+
+    assert exit_code == 0
+    assert source.read_text(encoding="utf-8") == original
+    assert not (tmp_path / "modules").exists()
+    output = capsys.readouterr().out
+    assert "Would split 'area' successfully." in output
+    assert "Plan:" in output
+    assert "Functions: area" in output
+    assert "Check passed: 1 function(s) can be split." in output
+    assert "@@" not in output
+
+
+def test_check_file_reports_multiple_plans_without_writing(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "main.py"
+    original = "def one():\n    return 1\n\n\ndef two():\n    return 2\n"
+    source.write_text(original, encoding="utf-8")
+
+    exit_code = main(["check", "main.py", "--cwd", str(tmp_path)])
+
+    assert exit_code == 0
+    assert source.read_text(encoding="utf-8") == original
+    assert not (tmp_path / "modules").exists()
+    output = capsys.readouterr().out
+    assert "Functions: one" in output
+    assert "Functions: two" in output
+    assert "Check passed: 2 function(s) can be split." in output
+
+
+def test_check_reports_safety_failures_without_writing(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "main.py"
+    original = "CACHE = {}\n\n\ndef remember(value):\n    CACHE['value'] = value\n    return value\n"
+    source.write_text(original, encoding="utf-8")
+
+    exit_code = main(["check", "main.remember", "--cwd", str(tmp_path)])
+
+    assert exit_code == 1
+    assert source.read_text(encoding="utf-8") == original
+    assert not (tmp_path / "modules").exists()
+    output = capsys.readouterr().out
+    assert "mutable module global" in output
 
 
 def test_splitall_supports_include_exclude_and_public_only_filters(tmp_path: Path, capsys) -> None:
