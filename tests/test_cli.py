@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -733,6 +734,312 @@ def test_splitmethod_rejects_custom_decorators(tmp_path: Path, capsys) -> None:
 
     assert exit_code == 1
     assert "Refusing to split decorated method" in capsys.readouterr().out
+
+
+def test_paradigm_oop_restructures_top_level_functions_with_wrappers(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "main.py"
+    source.write_text(
+        "VALUE = 3\n\n"
+        "def helper(x):\n"
+        "    return x + VALUE\n\n"
+        "def area(r):\n"
+        "    return helper(r * r)\n\n"
+        "async def fetch_user(user_id: int) -> int:\n"
+        "    return area(user_id)\n\n"
+        "def stream(limit):\n"
+        "    for index in range(limit):\n"
+        "        yield area(index)\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["paradigm", "OOP", "main.py", "--cwd", str(tmp_path), "--validate"])
+
+    assert exit_code == 0
+    updated = source.read_text(encoding="utf-8")
+    assert "class MainOperations:" in updated
+    assert "    @staticmethod\n    def helper(x):" in updated
+    assert "def area(r):\n    return MainOperations.area(r)" in updated
+    assert "async def fetch_user(user_id: int) -> int:" in updated
+    assert "return await MainOperations.fetch_user(user_id)" in updated
+    assert "def stream(limit):\n    return MainOperations.stream(limit)" in updated
+    assert "Restructured 4 function(s) for OOP." in capsys.readouterr().out
+
+    sys.path.insert(0, str(tmp_path))
+    try:
+        import main as transformed_main
+
+        assert transformed_main.area(2) == 7
+        assert transformed_main.MainOperations.area(2) == 7
+        assert list(transformed_main.stream(3)) == [3, 4, 7]
+    finally:
+        sys.path.remove(str(tmp_path))
+        sys.modules.pop("main", None)
+
+
+def test_paradigm_oop_preview_does_not_write(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "main.py"
+    original = "def area(r):\n    return r * r\n"
+    source.write_text(original, encoding="utf-8")
+
+    exit_code = main(["paradigm", "OOP", "main.py", "--cwd", str(tmp_path), "--preview"])
+
+    assert exit_code == 0
+    assert source.read_text(encoding="utf-8") == original
+    output = capsys.readouterr().out
+    assert "Would restructure" in output
+    assert "+class MainOperations:" in output
+
+
+def test_paradigm_oop_defaults_to_recursive_project_directory(tmp_path: Path) -> None:
+    package = tmp_path / "app"
+    package.mkdir()
+    (package / "service.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+    hidden = tmp_path / ".venv"
+    hidden.mkdir()
+    (hidden / "ignored.py").write_text("def ignored():\n    return 1\n", encoding="utf-8")
+
+    exit_code = main(["paradigm", "OOP", "--cwd", str(tmp_path)])
+
+    assert exit_code == 0
+    assert "class ServiceOperations:" in (package / "service.py").read_text(encoding="utf-8")
+    assert "class IgnoredOperations:" not in (hidden / "ignored.py").read_text(encoding="utf-8")
+
+
+def test_paradigm_oop_skips_decorated_and_overloaded_functions(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "main.py"
+    original = (
+        "from typing import overload\n\n"
+        "from framework import deco\n\n"
+        "@deco\n"
+        "def route():\n"
+        "    return 1\n\n"
+        "@overload\n"
+        "def parse(value: str) -> int: ...\n\n"
+        "@overload\n"
+        "def parse(value: int) -> int: ...\n\n"
+        "def parse(value):\n"
+        "    return int(value)\n"
+    )
+    source.write_text(original, encoding="utf-8")
+
+    exit_code = main(["paradigm", "OOP", "main.py", "--cwd", str(tmp_path), "--validate"])
+
+    assert exit_code == 0
+    assert source.read_text(encoding="utf-8") == original
+    output = capsys.readouterr().out
+    assert "Skipped" in output
+    assert "Restructured 0 function(s) for OOP." in output
+
+
+def test_paradigm_oop_can_be_undone(tmp_path: Path) -> None:
+    source = tmp_path / "main.py"
+    original = "def area(r):\n    return r * r\n"
+    source.write_text(original, encoding="utf-8")
+
+    split_exit = main(["paradigm", "OOP", "main.py", "--cwd", str(tmp_path)])
+    undo_exit = main(["undo", "--cwd", str(tmp_path)])
+
+    assert split_exit == 0
+    assert undo_exit == 0
+    assert source.read_text(encoding="utf-8") == original
+
+
+def test_paradigm_oop_rejects_existing_generated_class_without_writing(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "main.py"
+    original = "class MainOperations:\n    pass\n\n\ndef run():\n    return 1\n"
+    source.write_text(original, encoding="utf-8")
+
+    exit_code = main(["paradigm", "OOP", "main.py", "--cwd", str(tmp_path)])
+
+    assert exit_code == 1
+    assert source.read_text(encoding="utf-8") == original
+    assert "already exists" in capsys.readouterr().out
+
+
+def test_paradigm_oop_places_generated_class_after_later_annotation_types(tmp_path: Path) -> None:
+    source = tmp_path / "main.py"
+    source.write_text(
+        "class Node:\n"
+        "    pass\n\n"
+        "def make_node() -> Node:\n"
+        "    return Node()\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["paradigm", "OOP", "main.py", "--cwd", str(tmp_path), "--validate"])
+
+    assert exit_code == 0
+    updated = source.read_text(encoding="utf-8")
+    assert updated.index("class Node:") < updated.index("class MainOperations:")
+
+    sys.path.insert(0, str(tmp_path))
+    try:
+        import main as transformed_main
+
+        assert isinstance(transformed_main.make_node(), transformed_main.Node)
+        assert isinstance(transformed_main.MainOperations.make_node(), transformed_main.Node)
+    finally:
+        sys.path.remove(str(tmp_path))
+        sys.modules.pop("main", None)
+
+
+def test_paradigm_oop_skips_functions_used_during_class_initialization(tmp_path: Path) -> None:
+    source = tmp_path / "main.py"
+    original = (
+        "def build_value(value):\n"
+        "    return value * 2\n\n"
+        "class UsesHelper:\n"
+        "    value = build_value(3)\n\n"
+        "def later(value):\n"
+        "    return value + 1\n"
+    )
+    source.write_text(original, encoding="utf-8")
+
+    exit_code = main(["paradigm", "OOP", "main.py", "--cwd", str(tmp_path), "--validate"])
+
+    assert exit_code == 0
+    updated = source.read_text(encoding="utf-8")
+    assert "def build_value(value):\n    return value * 2" in updated
+    assert "    @staticmethod\n    def later(value):" in updated
+
+    sys.path.insert(0, str(tmp_path))
+    try:
+        import main as transformed_main
+
+        assert transformed_main.UsesHelper.value == 6
+        assert transformed_main.later(2) == 3
+    finally:
+        sys.path.remove(str(tmp_path))
+        sys.modules.pop("main", None)
+
+
+def test_paradigm_oop_skips_functions_with_multiline_string_literals(tmp_path: Path) -> None:
+    source = tmp_path / "main.py"
+    original = (
+        "def render_code():\n"
+        "    code = '''\\\n"
+        "def example():\n"
+        "    return 1'''\n"
+        "    return code\n\n"
+        "def plain(value):\n"
+        "    return value\n"
+    )
+    source.write_text(original, encoding="utf-8")
+
+    exit_code = main(["paradigm", "OOP", "main.py", "--cwd", str(tmp_path), "--validate"])
+
+    assert exit_code == 0
+    updated = source.read_text(encoding="utf-8")
+    assert "def render_code():\n    code = '''\\\ndef example():" in updated
+    assert "    @staticmethod\n    def plain(value):" in updated
+
+    sys.path.insert(0, str(tmp_path))
+    try:
+        import main as transformed_main
+
+        assert transformed_main.render_code() == "def example():\n    return 1"
+        assert transformed_main.plain(3) == 3
+    finally:
+        sys.path.remove(str(tmp_path))
+        sys.modules.pop("main", None)
+
+
+def test_paradigm_functional_adds_functional_facade(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "main.py"
+    source.write_text(
+        "def double(value):\n"
+        "    return value * 2\n\n"
+        "def increment(value):\n"
+        "    return value + 1\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["paradigm", "functional", "main.py", "--cwd", str(tmp_path), "--validate"])
+
+    assert exit_code == 0
+    updated = source.read_text(encoding="utf-8")
+    assert "FUNCTIONAL_API = {" in updated
+    assert '"double": double' in updated
+    assert "def pipe(value, *functions):" in updated
+    assert "Restructured 2 function(s) for functional." in capsys.readouterr().out
+
+    sys.path.insert(0, str(tmp_path))
+    try:
+        import main as transformed_main
+
+        assert transformed_main.FUNCTIONAL_API["double"](3) == 6
+        assert transformed_main.pipe(3, transformed_main.double, transformed_main.increment) == 7
+        composed = transformed_main.compose_functions(transformed_main.increment, transformed_main.double)
+        assert composed(3) == 7
+    finally:
+        sys.path.remove(str(tmp_path))
+        sys.modules.pop("main", None)
+
+
+def test_paradigm_event_driven_adds_dispatch_facade(tmp_path: Path) -> None:
+    source = tmp_path / "main.py"
+    source.write_text(
+        "def user_created(name):\n"
+        "    return f'created:{name}'\n\n"
+        "def user_deleted(name):\n"
+        "    return f'deleted:{name}'\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["paradigm", "events", "main.py", "--cwd", str(tmp_path), "--validate"])
+
+    assert exit_code == 0
+    updated = source.read_text(encoding="utf-8")
+    assert "EVENT_HANDLERS = {" in updated
+    assert '"user_created": user_created' in updated
+    assert "def dispatch_event(event_name, *args, **kwargs):" in updated
+
+    sys.path.insert(0, str(tmp_path))
+    try:
+        import main as transformed_main
+
+        assert transformed_main.dispatch_event("user_created", "Ada") == "created:Ada"
+        assert transformed_main.EVENT_HANDLERS["user_deleted"]("Ada") == "deleted:Ada"
+    finally:
+        sys.path.remove(str(tmp_path))
+        sys.modules.pop("main", None)
+
+
+def test_paradigm_procedural_flattens_generated_oop_class(tmp_path: Path) -> None:
+    source = tmp_path / "main.py"
+    source.write_text("def area(r):\n    return r * r\n", encoding="utf-8")
+
+    oop_exit = main(["paradigm", "OOP", "main.py", "--cwd", str(tmp_path), "--validate"])
+    procedural_exit = main(["paradigm", "imperative", "main.py", "--cwd", str(tmp_path), "--validate"])
+
+    assert oop_exit == 0
+    assert procedural_exit == 0
+    updated = source.read_text(encoding="utf-8")
+    assert updated.index("def area(r):") < updated.index("class MainOperations:")
+    assert "return MainOperations.area(r)" not in updated
+    assert "area = staticmethod(area)" in updated
+
+    sys.path.insert(0, str(tmp_path))
+    try:
+        import main as transformed_main
+
+        assert transformed_main.area(3) == 9
+        assert transformed_main.MainOperations.area(3) == 9
+    finally:
+        sys.path.remove(str(tmp_path))
+        sys.modules.pop("main", None)
+
+
+def test_paradigm_facades_refuse_name_collisions_without_writing(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "main.py"
+    original = "FUNCTIONAL_API = {}\n\n\ndef area(r):\n    return r * r\n"
+    source.write_text(original, encoding="utf-8")
+
+    exit_code = main(["paradigm", "fp", "main.py", "--cwd", str(tmp_path)])
+
+    assert exit_code == 1
+    assert source.read_text(encoding="utf-8") == original
+    assert "name(s) already exist" in capsys.readouterr().out
 
 
 def test_config_init_and_show(tmp_path: Path, capsys) -> None:

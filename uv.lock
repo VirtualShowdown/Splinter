@@ -140,7 +140,7 @@ wheels = [
 
 [[package]]
 name = "manasplice"
-version = "0.1.0.4a0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "colorama" },

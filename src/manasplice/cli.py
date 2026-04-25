@@ -16,7 +16,15 @@ from .analysis import iter_assigned_names, iter_imported_names, statement_start_
 from .config import load_project_config
 from .dependencies import collect_dependency_names, collect_required_import_names, render_dependency_blocks
 from .exceptions import PySplitError
-from .history import record_split_history, rollback_last
+from .history import record_change_history, record_split_history, rollback_last
+from .paradigm import (
+    ParadigmOptions,
+    ParadigmResult,
+    transform_module_to_event_driven,
+    transform_module_to_functional,
+    transform_module_to_oop,
+    transform_module_to_procedural,
+)
 from .resolver import TargetSpec, parse_target, resolve_target
 from .rewrite import (
     build_import_block,
@@ -256,6 +264,30 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
     splitmethod.add_argument("--require-clean-git", action="store_true")
     splitmethod.add_argument("--git-commit", action="store_true")
 
+    paradigm = subparsers.add_parser("paradigm", help="Restructure Python modules toward a programming paradigm.")
+    paradigm.add_argument(
+        "style",
+        help="Target paradigm. Supported: OOP, functional, event-driven, procedural.",
+    )
+    paradigm.add_argument(
+        "path",
+        nargs="?",
+        help="Python file to restructure. Defaults to the current project directory.",
+    )
+    paradigm.add_argument("--dir", dest="directory", help="Directory whose Python files should be restructured.")
+    paradigm.add_argument("--cwd", default=".", help="Project root to resolve from. Defaults to current directory.")
+    paradigm.add_argument("--preview", action="store_true", help="Show planned changes without writing files.")
+    paradigm.add_argument("--validate", action="store_true", help="Validate rewritten Python before writing files.")
+    paradigm.add_argument("--recursive", action="store_true", help="Recurse into subdirectories.")
+    paradigm.add_argument("--class-name", help="Class name to use when restructuring a single file.")
+    paradigm.add_argument("--include", help="Comma-separated function name patterns to include, like 'run_*'.")
+    paradigm.add_argument("--exclude", help="Comma-separated function name patterns to exclude, like 'main,_*'.")
+    paradigm.add_argument("--public-only", action="store_true", help="Only restructure public top-level functions.")
+    paradigm.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    paradigm.add_argument("--format", nargs="?", const="ruff", default=config.get("format", None))
+    paradigm.add_argument("--require-clean-git", action="store_true")
+    paradigm.add_argument("--git-commit", action="store_true")
+
     undo = subparsers.add_parser(
         "undo",
         help="Roll back the last split operation",
@@ -403,6 +435,34 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"Recorded rollback history: {history_file}")
                 _git_commit(cwd, args.git_commit, f"manasplice splitmethod {args.target}", [result])
             return 0
+        if args.command == "paradigm":
+            cwd = Path(args.cwd)
+            _require_clean_git(cwd, args.require_clean_git)
+            _preflight_git_commit(cwd, args.git_commit)
+            paradigm_results = _handle_paradigm(args, cwd)
+            if not args.preview:
+                _format_file_changes(_paradigm_file_changes(paradigm_results), _normalize_format_tool(args.format))
+            changed_count = sum(len(result.function_names) for result in paradigm_results)
+            if args.json:
+                _print_json(
+                    {
+                        "status": "ok",
+                        "style": args.style,
+                        "count": changed_count,
+                        "results": [_paradigm_result_to_json(result) for result in paradigm_results],
+                    }
+                )
+            else:
+                action = "Would restructure" if args.preview else "Restructured"
+                print(f"{action} {changed_count} function(s) for {_normalize_paradigm_style(args.style)}.")
+            if changed_count and not args.preview:
+                changes = _paradigm_file_changes(paradigm_results)
+                command = f"manasplice paradigm {_normalize_paradigm_style(args.style)}"
+                history_file = record_change_history(cwd, command, changes)
+                if not args.json:
+                    print(f"Recorded rollback history: {history_file}")
+                _git_commit_changes(cwd, args.git_commit, command, changes)
+            return 0
         if args.command == "undo":
             undo_count, history_file = rollback_last(Path(args.cwd), args.count)
             print(f"Rolled back {undo_count} operation(s).")
@@ -514,6 +574,103 @@ def _check(
     if emit_output:
         _print_split_result(result, show_diffs=False)
     return [result]
+
+
+def _handle_paradigm(args: argparse.Namespace, cwd: Path) -> list[ParadigmResult]:
+    style = _normalize_paradigm_style(args.style)
+    if args.class_name and (args.directory or not args.path or args.recursive):
+        raise PySplitError("--class-name can only be used with one explicit Python file.")
+
+    target_files = _resolve_paradigm_files(args.path, args.directory, cwd, recursive=args.recursive)
+    results: list[ParadigmResult] = []
+    for file_path in target_files:
+        options = ParadigmOptions(
+            preview=args.preview,
+            class_name=args.class_name,
+            validate=args.validate,
+            include_patterns=_parse_patterns(args.include),
+            exclude_patterns=_parse_patterns(args.exclude),
+            public_only=args.public_only,
+        )
+        result = _transform_module_for_style(file_path, style, options)
+        results.append(result)
+        if not args.json:
+            _print_paradigm_result(result, style=style, show_diffs=args.preview)
+    return results
+
+
+def _normalize_paradigm_style(raw_style: str) -> str:
+    normalized = raw_style.strip().casefold().replace("_", "-")
+    aliases = {
+        "oo": "oop",
+        "object-oriented": "oop",
+        "object-oriented-programming": "oop",
+        "fp": "functional",
+        "event": "event-driven",
+        "eventdriven": "event-driven",
+        "events": "event-driven",
+        "proc": "procedural",
+        "imperative": "procedural",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"oop", "functional", "event-driven", "procedural"}:
+        raise PySplitError("Unsupported paradigm. Supported: OOP, functional, event-driven, procedural.")
+    return "OOP" if normalized == "oop" else normalized
+
+
+def _transform_module_for_style(file_path: Path, style: str, options: ParadigmOptions) -> ParadigmResult:
+    if style == "OOP":
+        return transform_module_to_oop(file_path, options=options)
+    if style == "functional":
+        return transform_module_to_functional(file_path, options=options)
+    if style == "event-driven":
+        return transform_module_to_event_driven(file_path, options=options)
+    if style == "procedural":
+        return transform_module_to_procedural(file_path, options=options)
+    raise PySplitError("Unsupported paradigm. Supported: OOP, functional, event-driven, procedural.")
+
+
+def _resolve_paradigm_files(
+    path_arg: str | None,
+    directory_arg: str | None,
+    cwd: Path,
+    *,
+    recursive: bool,
+) -> list[Path]:
+    if path_arg and directory_arg:
+        raise PySplitError("paradigm requires either a file path or --dir, but not both.")
+
+    if path_arg:
+        file_path = (cwd / path_arg).resolve()
+        if not file_path.exists() or not file_path.is_file():
+            raise PySplitError(f"File not found: {file_path}")
+        if file_path.suffix != ".py":
+            raise PySplitError(f"paradigm only supports Python files: {file_path}")
+        return [file_path]
+
+    directory = (cwd / directory_arg).resolve() if directory_arg else cwd.resolve()
+    if not directory.exists() or not directory.is_dir():
+        raise PySplitError(f"Directory not found: {directory}")
+
+    use_recursive = recursive or directory_arg is None
+    iterator = directory.rglob("*.py") if use_recursive else directory.glob("*.py")
+    return sorted(file_path for file_path in iterator if _is_restructurable_python_file(file_path, directory))
+
+
+def _is_restructurable_python_file(file_path: Path, root: Path) -> bool:
+    if file_path.name == "__init__.py":
+        return False
+    ignored_parts = {
+        ".git",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".venv",
+        "__pycache__",
+        "build",
+        "dist",
+    }
+    return not ignored_parts.intersection(file_path.relative_to(root).parts)
 
 
 def _resolve_splitall_files(
@@ -737,6 +894,27 @@ def _print_group_result(result: GroupSplitResult, *, show_diffs: bool = True) ->
     print(f"Inserted import: {result.import_statement}")
 
 
+def _print_paradigm_result(result: ParadigmResult, *, style: str, show_diffs: bool = True) -> None:
+    if not result.function_names:
+        if result.skipped:
+            print(f"Skipped {result.module_file}: no safe top-level functions to restructure.")
+        return
+
+    action = "Would restructure" if result.preview else "Restructured"
+    verb = _color_text(action, Fore.CYAN if result.preview else Fore.GREEN)
+    names_str = _color_text(", ".join(result.function_names), Fore.MAGENTA)
+    print(f"{verb} {result.module_file} for {style} via {result.class_name}: {names_str}")
+    for function_name, reason in result.skipped.items():
+        print(f"Skipped {function_name}: {reason}.")
+    if result.preview and show_diffs:
+        for diff in result.preview_diffs:
+            _print_preview_diff(diff)
+
+
+def _paradigm_file_changes(results: list[ParadigmResult]) -> list[FileChange]:
+    return [change for result in results for change in result.file_changes]
+
+
 def _parse_patterns(raw_patterns: str | list | None) -> list[str]:
     if raw_patterns is None:
         return []
@@ -833,6 +1011,24 @@ def _result_to_json(result: SplitResult | GroupSplitResult) -> dict[str, object]
     }
 
 
+def _paradigm_result_to_json(result: ParadigmResult) -> dict[str, object]:
+    return {
+        "preview": result.preview,
+        "source": str(result.module_file),
+        "class_name": result.class_name,
+        "functions": result.function_names,
+        "skipped": result.skipped,
+        "changes": [
+            {
+                "path": str(change.path),
+                "action": "update" if change.existed_before else "create",
+                "changed": change.before_text != change.after_text,
+            }
+            for change in result.file_changes
+        ],
+    }
+
+
 def _print_json(data: dict[str, object]) -> None:
     print(json.dumps(data, indent=2, sort_keys=True))
 
@@ -846,6 +1042,18 @@ def _format_results(results: list[SplitResult | GroupSplitResult], format_tool: 
     files = sorted(
         {str(change.path) for result in results for change in result.file_changes if change.path.suffix == ".py"}
     )
+    if not files:
+        return
+    subprocess.run(["ruff", "format", *files], check=False, capture_output=True, text=True)
+    subprocess.run(["ruff", "check", "--fix", *files], check=False, capture_output=True, text=True)
+
+
+def _format_file_changes(file_changes: list[FileChange], format_tool: str | None) -> None:
+    if not file_changes or not format_tool:
+        return
+    if format_tool != "ruff":
+        raise PySplitError(f"Unsupported formatter '{format_tool}'. Only 'ruff' is supported.")
+    files = sorted({str(change.path) for change in file_changes if change.path.suffix == ".py"})
     if not files:
         return
     subprocess.run(["ruff", "format", *files], check=False, capture_output=True, text=True)
@@ -885,6 +1093,22 @@ def _git_commit(cwd: Path, enabled: bool, message: str, results: list[SplitResul
     if status.returncode != 0:
         raise PySplitError("--git-commit was requested, but this is not a git repository.")
     changed_paths = sorted({str(change.path) for result in results for change in result.file_changes})
+    if not changed_paths:
+        return
+    subprocess.run(["git", "add", "--", *changed_paths], cwd=cwd, check=True)
+    staged = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=cwd, check=False)
+    if staged.returncode == 0:
+        return
+    subprocess.run(["git", "commit", "--no-verify", "-m", message], cwd=cwd, check=True)
+
+
+def _git_commit_changes(cwd: Path, enabled: bool, message: str, changes: list[FileChange]) -> None:
+    if not enabled:
+        return
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=cwd, capture_output=True, text=True, check=False)
+    if status.returncode != 0:
+        raise PySplitError("--git-commit was requested, but this is not a git repository.")
+    changed_paths = sorted({str(change.path) for change in changes})
     if not changed_paths:
         return
     subprocess.run(["git", "add", "--", *changed_paths], cwd=cwd, check=True)

@@ -21,9 +21,16 @@ def record_split_history(cwd: Path, command: str, results: list[SplitResult | Gr
     if not results:
         raise PySplitError("Cannot record rollback history for an empty split operation.")
 
+    return record_change_history(cwd, command, _coalesce_changes(results))
+
+
+def record_change_history(cwd: Path, command: str, changes: list[FileChange]) -> Path:
+    if not changes:
+        raise PySplitError("Cannot record rollback history for an empty operation.")
+
     history_file = _history_file(cwd)
     history = _load_history(history_file)
-    history.append(_serialize_entry(cwd, HistoryEntry(command=command, changes=_coalesce_changes(results))))
+    history.append(_serialize_entry(cwd, HistoryEntry(command=command, changes=changes)))
     _write_history(history_file, history)
     return history_file
 

@@ -10,6 +10,7 @@
 
 - Splits one top-level function with `splitfunc`.
 - Splits every top-level function in a file, or every top-level function in each Python file in a directory, with `splitall`.
+- Restructures modules toward a simple OOP shape with `paradigm OOP`.
 - Checks whether a split is safe, and shows the planned changes without writing files, with `check`.
 - Emits JSON plans with `--json` for automation.
 - Copies the imports and top-level definitions the extracted function needs.
@@ -118,6 +119,12 @@ manasplice splitfunc <module>.<function> --keep-decorators
 manasplice splitfunc <module>.<function> --strip-decorators
 manasplice splitmethod <module>.<Class>.<method>
 manasplice splitfunc <module>.<function> --force
+manasplit paradigm OOP
+manasplit paradigm functional <path/to/file.py>
+manasplit paradigm event-driven <path/to/file.py>
+manasplit paradigm procedural <path/to/file.py>
+manasplit paradigm OOP --dir <directory> --recursive
+manasplit paradigm OOP <path/to/file.py> --preview
 ```
 
 Examples:
@@ -142,6 +149,11 @@ uv run manasplice splitfunc main.area --output modules/geometry.py
 uv run manasplice splitfunc main.area --into modules/geometry.py
 uv run manasplice splitfunc main.area --format
 uv run manasplice splitmethod services.UserService.normalize_name
+uv run manasplit paradigm OOP
+uv run manasplit paradigm functional main.py
+uv run manasplit paradigm event-driven main.py
+uv run manasplit paradigm procedural main.py
+uv run manasplit paradigm OOP main.py --preview
 uv run manasplice undo
 ```
 
@@ -177,6 +189,10 @@ format = "ruff"
 ## Notes
 
 - ManaSplice primarily moves top-level functions. `splitmethod` supports conservative class-method extraction by generating a forwarding wrapper and refusing methods without explicit `self`/`cls`.
+- `paradigm OOP` converts safe top-level functions into `@staticmethod`s on a generated module class and leaves compatibility wrappers in place. With no path, it scans the project recursively while skipping virtualenvs, caches, build output, and `__init__.py`.
+- `paradigm functional` adds a generated functional facade with `FUNCTIONAL_API`, `pipe`, and `compose_functions` without changing existing function definitions.
+- `paradigm event-driven` adds `EVENT_HANDLERS` and `dispatch_event` so functions can be invoked through event names.
+- `paradigm procedural` flattens ManaSplice-generated OOP staticmethod classes back into top-level functions while preserving a compatibility class.
 - `splitall` is literal: it will split every top-level function it finds, including helper functions and `main()` if present.
 - Use `check` for a no-write safety report without diffs.
 - Use `--json` with `check` or preview commands to get a machine-readable plan instead of human text and colored diffs.
