@@ -284,6 +284,79 @@ def test_git_commit_still_commits_inside_git(tmp_path: Path) -> None:
     assert "manasplice splitfunc main.area" in log.stdout
 
 
+def test_git_commit_does_not_run_repository_hooks(tmp_path: Path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.email", "qa@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "QA"], cwd=tmp_path, check=True)
+    source = tmp_path / "main.py"
+    source.write_text("def area(r):\n    return r * r\n", encoding="utf-8")
+    subprocess.run(["git", "add", "main.py"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    marker = tmp_path / "hook_marker.txt"
+    hook = tmp_path / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\necho hook-ran > {marker.as_posix()!r}\n", encoding="utf-8")
+    hook.chmod(0o755)
+
+    exit_code = main(["splitfunc", "main.area", "--cwd", str(tmp_path), "--git-commit"])
+
+    assert exit_code == 0
+    assert not marker.exists()
+
+
+def test_undo_rejects_history_path_traversal_write(tmp_path: Path, capsys) -> None:
+    victim = tmp_path / "victim.txt"
+    victim.write_text("SAFE", encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+    history = [
+        {
+            "command": "attacker",
+            "changes": [
+                {
+                    "path": "../victim.txt",
+                    "existed_before": True,
+                    "before_text": "PWNED",
+                    "after_text": "SAFE",
+                }
+            ],
+        }
+    ]
+    (project / ".manasplice_history.json").write_text(json.dumps(history), encoding="utf-8")
+
+    exit_code = main(["undo", "--cwd", str(project)])
+
+    assert exit_code == 1
+    assert "outside the project root" in capsys.readouterr().out
+    assert victim.read_text(encoding="utf-8") == "SAFE"
+
+
+def test_undo_rejects_history_path_traversal_delete(tmp_path: Path, capsys) -> None:
+    victim = tmp_path / "delete_me.txt"
+    victim.write_text("SAFE", encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+    history = [
+        {
+            "command": "attacker",
+            "changes": [
+                {
+                    "path": "../delete_me.txt",
+                    "existed_before": False,
+                    "before_text": "",
+                    "after_text": "SAFE",
+                }
+            ],
+        }
+    ]
+    (project / ".manasplice_history.json").write_text(json.dumps(history), encoding="utf-8")
+
+    exit_code = main(["undo", "--cwd", str(project)])
+
+    assert exit_code == 1
+    assert "outside the project root" in capsys.readouterr().out
+    assert victim.exists()
+
+
 def test_splitall_supports_include_exclude_and_public_only_filters(tmp_path: Path, capsys) -> None:
     source = tmp_path / "main.py"
     source.write_text(

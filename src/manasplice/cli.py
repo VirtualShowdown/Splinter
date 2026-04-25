@@ -891,7 +891,7 @@ def _git_commit(cwd: Path, enabled: bool, message: str, results: list[SplitResul
     staged = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=cwd, check=False)
     if staged.returncode == 0:
         return
-    subprocess.run(["git", "commit", "-m", message], cwd=cwd, check=True)
+    subprocess.run(["git", "commit", "--no-verify", "-m", message], cwd=cwd, check=True)
 
 
 def _run_project_checks(results: list[SplitResult | GroupSplitResult], cwd: Path, *, emit_output: bool) -> None:

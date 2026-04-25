@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "manasplice"
-version = "0.1.0.4-alpha"
+version = "0.1.1"
 description = "Split top-level Python functions into dedicated modules and rewire imports automatically."
 readme = "README.md"
 license = { text = "MIT" }

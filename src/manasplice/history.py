@@ -46,7 +46,7 @@ def rollback_last(cwd: Path, count: int = 1) -> tuple[int, Path]:
     for entry_data in reversed(to_rollback):
         entry = _deserialize_entry(cwd, entry_data)
         for change in reversed(entry.changes):
-            _restore_change(change)
+            _restore_change(change, cwd)
 
     _write_history(history_file, remaining)
     return count, history_file
@@ -116,7 +116,7 @@ def _deserialize_entry(cwd: Path, data: dict[str, object]) -> HistoryEntry:
 
         changes.append(
             FileChange(
-                path=(cwd / path_value).resolve(),
+                path=_resolve_history_path(cwd, path_value),
                 existed_before=existed_before,
                 before_text=before_text,
                 after_text=after_text,
@@ -126,7 +126,21 @@ def _deserialize_entry(cwd: Path, data: dict[str, object]) -> HistoryEntry:
     return HistoryEntry(command=str(data.get("command", "split")), changes=changes)
 
 
-def _restore_change(change: FileChange) -> None:
+def _resolve_history_path(cwd: Path, path_value: str) -> Path:
+    raw_path = Path(path_value)
+    if raw_path.is_absolute():
+        raise PySplitError("Rollback history contains an absolute path.")
+
+    root = cwd.resolve()
+    resolved = (root / raw_path).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise PySplitError("Rollback history contains a path outside the project root.") from exc
+    return resolved
+
+
+def _restore_change(change: FileChange, cwd: Path) -> None:
     if change.existed_before:
         change.path.parent.mkdir(parents=True, exist_ok=True)
         write_text_preserving_newlines(change.path, change.before_text)
@@ -134,12 +148,18 @@ def _restore_change(change: FileChange) -> None:
 
     if change.path.exists():
         change.path.unlink()
-    _prune_empty_directories(change.path.parent)
+    _prune_empty_directories(change.path.parent, cwd.resolve())
 
 
-def _prune_empty_directories(directory: Path) -> None:
-    current = directory
+def _prune_empty_directories(directory: Path, root: Path) -> None:
+    current = directory.resolve()
     while current.exists() and current.is_dir():
+        if current == root:
+            break
+        try:
+            current.relative_to(root)
+        except ValueError:
+            break
         try:
             next(current.iterdir())
             break
